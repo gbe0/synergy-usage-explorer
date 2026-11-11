@@ -266,6 +266,7 @@ dash.calc('daily', {
           peakCost: r2(d.peakCost),
           supply: r2(r.supplyPerDay || 0),
           credit: r2(r.creditPerDay || 0),
+          supplyNet: r2(Math.max(0, (r.supplyPerDay || 0) - (r.creditPerDay || 0))),
           cost: r2(d.net),
           avg7Cost: full ? r2(week.reduce((s, w) => s + w.net, 0) / 7) : null,
           status: d.status,
@@ -600,6 +601,307 @@ dash.calc('weekdays', {
   },
 });
 
+dash.calc('breakEven', {
+  inputs: ['dayTotals', 'plans', 'ranges'],
+  title: 'Where each pair of tariffs breaks even',
+  description: 'For each date range and each pair of tariffs, at the rates in force on the range’s last day: the difference in cost per day now, the share of use at peak at which the two would cost the same (keeping total kWh, and the split of the rest between off-peak and super off-peak, as they were), and the kWh a day at which they would cost the same (keeping the split between periods as it was). `cheaperWhenPeak` and `cheaperWhenUse` say which side of the break-even point the first tariff is cheaper on.',
+  fn: (dayTotals, plans, ranges) => {
+    const r1 = (x) => (x == null ? null : Math.round(x * 10) / 10);
+    const r2 = (x) => (x == null ? null : Math.round(x * 100) / 100);
+    const out = [];
+    for (const g of ranges) {
+      if (!plans.length) continue;
+      // Use is the same on every tariff, so any one tariff's days give it.
+      const list = dayTotals.filter((d) => d.tariff === plans[0].tariff && d.date >= g.from && d.date <= g.to);
+      const n = list.length;
+      const P = list.reduce((s, d) => s + d.peakKWh, 0);
+      const O = list.reduce((s, d) => s + d.offPeakKWh, 0);
+      const S = list.reduce((s, d) => s + d.superOffPeakKWh, 0);
+      const K = P + O + S;
+      if (!n || K <= 0) continue;
+      const share = P / K, perDay = K / n, wO = O + S ? O / (O + S) : 0.5;
+      const model = new Map(plans.map((p) => {
+        const r = ratesOn(p, g.to);
+        const peak = r.peakCents / 100, rest = (wO * r.offPeakCents + (1 - wO) * r.superOffPeakCents) / 100;
+        return [p.tariff, {fixed: (r.supplyPerDay || 0) - (r.creditPerDay || 0), peak, rest, blend: share * peak + (1 - share) * rest, from: r.from}];
+      }));
+      for (const a of plans) {
+        for (const b of plans) {
+          if (a === b) continue;
+          const A = model.get(a.tariff), B = model.get(b.tariff);
+          // Cost a day at peak share s: fixed + perDay × (s × peak + (1 − s) × rest). Difference A − B:
+          const slope = perDay * ((A.peak - A.rest) - (B.peak - B.rest));
+          const base = (A.fixed - B.fixed) + perDay * (A.rest - B.rest);
+          const s = slope ? -base / slope : null;
+          const peakOk = s != null && s > 0 && s < 1;
+          // Cost a day at k kWh a day, same mix: fixed + k × blend.
+          const k = A.blend !== B.blend ? (B.fixed - A.fixed) / (A.blend - B.blend) : null;
+          const useOk = k != null && k > 0;
+          out.push({
+            range: g.range, tariff: a.tariff, other: b.tariff, ratesOn: g.to,
+            peakShareNow: r1(share * 100), kWhPerDayNow: r1(perDay),
+            diffPerDay: r2(base + slope * share),
+            breakEvenPeakShare: peakOk ? r1(s * 100) : null,
+            cheaperWhenPeak: peakOk ? (slope > 0 ? 'below' : 'above') : null,
+            breakEvenKWh: useOk ? r1(k) : null,
+            cheaperWhenUse: useOk ? (A.blend < B.blend ? 'above' : 'below') : null,
+          });
+        }
+      }
+    }
+    return out;
+  },
+});
+
+// Parts of the day, finer than the three rate periods: off-peak splits into overnight, morning and late evening.
+const BLOCKS = [
+  {block: 'Overnight', hours: '12 am–6 am', from: '00:00', to: '06:00', period: 'Off-peak'},
+  {block: 'Morning', hours: '6 am–9 am', from: '06:00', to: '09:00', period: 'Off-peak'},
+  {block: 'Daytime', hours: '9 am–3 pm', from: '09:00', to: '15:00', period: 'Super off-peak'},
+  {block: 'Early evening', hours: '3 pm–9 pm', from: '15:00', to: '21:00', period: 'Peak'},
+  {block: 'Late evening', hours: '9 pm–12 am', from: '21:00', to: '24:00', period: 'Off-peak'},
+];
+const blockOf = (time) => BLOCKS.find((b) => time >= b.from && time < b.to) || BLOCKS[0];
+
+dash.calc('blocks', {
+  inputs: ['halfHours', 'plans', 'ranges'],
+  title: 'Use by time of day',
+  description: 'For each date range and tariff, and each part of the day (overnight 12–6 am, morning 6–9 am, daytime 9 am–3 pm, early evening 3–9 pm, late evening 9 pm–12 am): kWh and energy cost a day, each part’s share of the day’s kWh and energy cost, and the average power drawn in it in kW.',
+  fn: (halfHours, plans, ranges) => {
+    const r2 = (x) => Math.round(x * 100) / 100;
+    const r1 = (x) => Math.round(x * 10) / 10;
+    const out = [];
+    for (const g of ranges) {
+      for (const p of plans) {
+        const acc = new Map(BLOCKS.map((b) => [b.block, {kWh: 0, cost: 0, n: 0}]));
+        const dates = new Set();
+        let kWh = 0, cost = 0;
+        for (const r of halfHours) {
+          if (r.tariff !== p.tariff || r.date < g.from || r.date > g.to) continue;
+          const a = acc.get(blockOf(r.time).block);
+          a.kWh += r.kWh; a.cost += r.cost || 0; a.n += 1;
+          kWh += r.kWh; cost += r.cost || 0;
+          dates.add(r.date);
+        }
+        const days = dates.size;
+        if (!days) continue;
+        for (const b of BLOCKS) {
+          const a = acc.get(b.block);
+          out.push({
+            range: g.range, tariff: p.tariff, block: b.block, hours: b.hours, period: b.period, days,
+            kWhPerDay: r2(a.kWh / days), kWhShare: kWh ? r1((a.kWh / kWh) * 100) : null,
+            costPerDay: r2(a.cost / days), costShare: cost ? r1((a.cost / cost) * 100) : null,
+            avgKW: a.n ? r2(a.kWh / (a.n * 0.5)) : null,
+          });
+        }
+      }
+    }
+    return out;
+  },
+});
+
+dash.calc('concentration', {
+  inputs: ['halfHours', 'plans', 'ranges'],
+  title: 'Where the cost concentrates',
+  description: 'For each date range and tariff, with the half-hours sorted from dearest to cheapest energy cost: the share of the energy cost in the dearest 1%, 5%, 10%, 25% and 50% of half-hours (and their share of kWh), the cumulative share at every 1% (`curve`), and, for the dearest 10%, how they split between rate periods and the hours they most often start in.',
+  fn: (halfHours, plans, ranges) => {
+    const r1 = (x) => Math.round(x * 10) / 10;
+    const out = [];
+    for (const g of ranges) {
+      for (const p of plans) {
+        const rows = halfHours.filter((r) => r.tariff === p.tariff && r.date >= g.from && r.date <= g.to && r.cost != null);
+        const N = rows.length;
+        const totalCost = rows.reduce((s, r) => s + r.cost, 0), totalKWh = rows.reduce((s, r) => s + r.kWh, 0);
+        if (!N || totalCost <= 0) continue;
+        rows.sort((a, b) => b.cost - a.cost);
+        const cumCost = [0], cumKWh = [0];
+        for (const r of rows) { cumCost.push(cumCost[cumCost.length - 1] + r.cost); cumKWh.push(cumKWh[cumKWh.length - 1] + r.kWh); }
+        const at = (pct) => Math.max(1, Math.round((N * pct) / 100));
+        const curve = d3.range(0, 101).map((pct) => (pct ? r1((cumCost[Math.round((N * pct) / 100)] / totalCost) * 100) : 0));
+        const tops = [1, 5, 10, 25, 50].map((pct) => {
+          const k = at(pct);
+          return {pct, halfHours: k, costShare: r1((cumCost[k] / totalCost) * 100), kWhShare: totalKWh ? r1((cumKWh[k] / totalKWh) * 100) : null, cost: cumCost[k]};
+        });
+        const top = rows.slice(0, at(10));
+        const periodShare = {};
+        for (const per of ['Peak', 'Off-peak', 'Super off-peak']) periodShare[per] = r1((top.filter((r) => r.period === per).length / top.length) * 100);
+        const hours = d3.rollups(top, (v) => v.length, (r) => Number(r.time.slice(0, 2))).sort((a, b) => b[1] - a[1]).slice(0, 3);
+        out.push({range: g.range, tariff: p.tariff, halfHours: N, totalCost, totalKWh, curve, tops, periodShare, topHours: hours.map(([h, c]) => ({hour: h, count: c}))});
+      }
+    }
+    return out;
+  },
+});
+
+// The same day a year earlier (29 Feb becomes 28 Feb).
+const yearBefore = (iso) => {
+  const y = Number(iso.slice(0, 4)) - 1;
+  const md = iso.slice(5) === '02-29' ? '02-28' : iso.slice(5);
+  return `${y}-${md}`;
+};
+
+dash.calc('lastYear', {
+  inputs: ['dayTotals', 'plans', 'ranges'],
+  title: 'Against the same dates a year earlier',
+  description: 'For each date range and tariff: kWh and cost a day (each day at its own rates, with supply, less credit) over the range and over the same dates a year earlier, and the change. Only given when the file has readings for at least 80% as many days a year earlier, and at least 7.',
+  fn: (dayTotals, plans, ranges) => {
+    const r1 = (x) => Math.round(x * 10) / 10;
+    const r2 = (x) => Math.round(x * 100) / 100;
+    const out = [];
+    for (const g of ranges) {
+      const pf = yearBefore(g.from), pt = yearBefore(g.to);
+      for (const p of plans) {
+        const mine = dayTotals.filter((d) => d.tariff === p.tariff);
+        const cur = mine.filter((d) => d.date >= g.from && d.date <= g.to);
+        const prev = mine.filter((d) => d.date >= pf && d.date <= pt);
+        if (!cur.length || prev.length < 7 || prev.length < 0.8 * cur.length) continue;
+        const per = (list, f) => list.reduce((s, d) => s + f(d), 0) / list.length;
+        const kWh = per(cur, (d) => d.kWh), kWhPrev = per(prev, (d) => d.kWh);
+        const cost = per(cur, (d) => d.energy + d.supply - d.credit), costPrev = per(prev, (d) => d.energy + d.supply - d.credit);
+        out.push({
+          range: g.range, tariff: p.tariff, days: cur.length, prevDays: prev.length, prevFrom: prev[0].date, prevTo: prev[prev.length - 1].date,
+          kWhPerDay: r1(kWh), prevKWhPerDay: r1(kWhPrev), kWhChange: kWhPrev ? r1((kWh / kWhPrev - 1) * 100) : null,
+          costPerDay: r2(cost), prevCostPerDay: r2(costPrev), costChange: costPrev ? r1((cost / costPrev - 1) * 100) : null,
+        });
+      }
+    }
+    return out;
+  },
+});
+
+dash.calc('demand', {
+  inputs: ['intervals'],
+  title: 'Peak demand each day',
+  description: 'For each day: its busiest half-hour (start time and rate period) and the average power drawn in it in kW (kWh × 2), and the average power over the whole day. Half-hour averages hide shorter bursts, such as a kettle.',
+  fn: (intervals) => {
+    const byDay = new Map();
+    for (const r of intervals) {
+      if (!byDay.has(r.date)) byDay.set(r.date, new Map());
+      const slots = byDay.get(r.date);
+      const s = slots.get(r.time) || {kWh: 0, period: r.period};
+      s.kWh += r.kWh;
+      slots.set(r.time, s);
+    }
+    const out = [];
+    for (const [date, slots] of byDay) {
+      let top = null, total = 0;
+      for (const [time, s] of slots) {
+        total += s.kWh;
+        if (!top || s.kWh > top.kWh) top = {time, kWh: s.kWh, period: s.period};
+      }
+      out.push({
+        date, time: top.time, period: top.period, peakKW: Math.round(top.kWh * 2 * 100) / 100,
+        avgKW: Math.round((total / (slots.size * 0.5)) * 100) / 100, halfHours: slots.size,
+      });
+    }
+    return out.sort((a, b) => (a.date < b.date ? -1 : 1));
+  },
+});
+
+/* ---------- Battery what-if ---------- */
+// Simulates a home battery, half-hour by half-hour, on one tariff's priced readings
+// (rows sorted by date and time). It charges from the grid in the day's cheapest
+// rate period, up to its size and power, and powers the home whenever the rate is
+// high enough to beat what the charge cost after losses. It never sends power to
+// the grid. Losses are all taken when charging.
+function simulateBattery(rows, plan, opts) {
+  const size = Math.max(0, Number(opts.size) || 0);
+  const perSlot = Math.max(0, Number(opts.power) || 0) * 0.5;
+  const eff = Math.min(1, Math.max(0.5, (Number(opts.efficiency) || 90) / 100));
+  let stored = 0, paidPerKWh = 0;   // energy in the battery, and what it cost per kWh delivered
+  let gridBefore = 0, gridAfter = 0, costBefore = 0, costAfter = 0, charged = 0, used = 0;
+  const days = new Set();
+  const avgBefore = new Map(), avgAfter = new Map();
+  for (const r of rows) {
+    days.add(r.date);
+    const rates = ratesOn(plan, r.date);
+    const price = rates[RATE_KEY[r.period]] / 100;
+    const cheapest = Math.min(rates.peakCents, rates.offPeakCents, rates.superOffPeakCents) / 100;
+    const dearest = Math.max(rates.peakCents, rates.offPeakCents, rates.superOffPeakCents) / 100;
+    let grid = r.kWh;
+    // Charging only pays when a dearer period can use the energy after losses (never on a flat rate).
+    if (price <= cheapest && dearest * eff > cheapest && size > 0 && stored < size) {
+      // Cheapest period: charge. Grid kWh = stored kWh / efficiency.
+      const add = Math.min(size - stored, perSlot);
+      if (add > 0) {
+        paidPerKWh = (stored * paidPerKWh + (add / eff) * price) / (stored + add);
+        stored += add;
+        charged += add / eff;
+        grid += add / eff;
+      }
+    } else if (stored > 0 && price > paidPerKWh) {
+      const give = Math.min(stored, perSlot, Math.max(0, r.kWh));
+      stored -= give;
+      used += give;
+      grid -= give;
+    }
+    gridBefore += r.kWh;
+    gridAfter += grid;
+    costBefore += r.kWh * price;
+    costAfter += grid * price;
+    avgBefore.set(r.time, (avgBefore.get(r.time) || 0) + r.kWh);
+    avgAfter.set(r.time, (avgAfter.get(r.time) || 0) + grid);
+  }
+  const n = days.size || 1;
+  const saving = costBefore - costAfter;
+  return {
+    days: days.size, saving, savingPerDay: saving / n, savingPerYear: (saving / n) * 365,
+    usedPerDay: used / n, chargedPerDay: charged / n, costBefore, costAfter,
+    extraKWh: gridAfter - gridBefore,
+    profile: DAY_SLOTS.map((time) => ({time, before: (avgBefore.get(time) || 0) / n, after: (avgAfter.get(time) || 0) / n})),
+  };
+}
+
+/* ---------- Next bill ---------- */
+// Adds up a billing period on one tariff: the days with readings at what they cost,
+// and the rest (days still to come, or missing) estimated from the average day over
+// the last 28 days of readings, kWh by rate period, priced at each day's rates. The
+// likely range uses the 10th and 90th percentile of those days' kWh instead.
+function projectBill(dayRows, plan, from, to) {
+  if (!dayRows.length || from > to) return null;
+  const inBill = new Map(dayRows.filter((d) => d.date >= from && d.date <= to).map((d) => [d.date, d]));
+  // The 28 days of readings up to the end of the bill (or the first 28, for a bill before the readings).
+  let recent = dayRows.filter((d) => d.date <= to).slice(-28);
+  if (!recent.length) recent = dayRows.slice(0, 28);
+  const sumOf = (f) => recent.reduce((s, d) => s + f(d), 0) / recent.length;
+  const avg = {peak: sumOf((d) => d.peakKWh), offPeak: sumOf((d) => d.offPeakKWh), superOffPeak: sumOf((d) => d.superOffPeakKWh)};
+  const totals = recent.map((d) => d.kWh).sort(d3.ascending);
+  const avgKWh = avg.peak + avg.offPeak + avg.superOffPeak || 1;
+  const scaleLow = d3.quantileSorted(totals, 0.1) / avgKWh, scaleHigh = d3.quantileSorted(totals, 0.9) / avgKWh;
+  const sofar = [...inBill.values()].reduce((s, d) => s + d.energy + d.supply - d.credit, 0);
+  let est = 0, estLow = 0, estHigh = 0, estDays = 0, futureDays = 0;
+  const last = dayRows[dayRows.length - 1].date;
+  const cumulative = [];
+  let run = 0, runLow = 0, runHigh = 0;
+  for (let t = Date.parse(from); t <= Date.parse(to); t += 86400000) {
+    const date = new Date(t).toISOString().slice(0, 10);
+    const d = inBill.get(date);
+    if (d) {
+      const c = d.energy + d.supply - d.credit;
+      run += c; runLow += c; runHigh += c;
+      cumulative.push({date, total: run, low: runLow, high: runHigh, actual: true});
+      continue;
+    }
+    const r = ratesOn(plan, date);
+    const energy = (avg.peak * r.peakCents + avg.offPeak * r.offPeakCents + avg.superOffPeak * r.superOffPeakCents) / 100;
+    const fixed = (r.supplyPerDay || 0) - (r.creditPerDay || 0);
+    est += energy + fixed;
+    estLow += energy * scaleLow + fixed;
+    estHigh += energy * scaleHigh + fixed;
+    estDays += 1;
+    if (date > last) futureDays += 1;
+    run += energy + fixed;
+    runLow += energy * scaleLow + fixed;
+    runHigh += energy * scaleHigh + fixed;
+    cumulative.push({date, total: run, low: runLow, high: runHigh, actual: false});
+  }
+  return {
+    from, to, days: cumulative.length, knownDays: inBill.size, estDays, futureDays, missingDays: estDays - futureDays,
+    sofar, estimate: est, total: sofar + est, low: sofar + estLow, high: sofar + estHigh,
+    avgDay: est && estDays ? est / estDays : null, basisFrom: recent[0].date, basisTo: recent[recent.length - 1].date, cumulative,
+  };
+}
+
 /* ---------- Unusual usage ---------- */
 // Days on either side used to decide what is usual, and the fewest that will do.
 const NEAR_DAYS = 14, MIN_NEAR = 10;
@@ -767,7 +1069,7 @@ const PERIODS = [
   {key: 'superOffPeak', costKey: 'superOffPeakCost', name: 'Super off-peak', color: 'var(--eu-super)'},
   {key: 'offPeak', costKey: 'offPeakCost', name: 'Off-peak', color: 'var(--eu-off)'},
 ];
-const COLOR = {'Peak': 'var(--eu-peak)', 'Super off-peak': 'var(--eu-super)', 'Off-peak': 'var(--eu-off)', 'Supply charge': 'var(--eu-supply)'};
+const COLOR = {'Peak': 'var(--eu-peak)', 'Super off-peak': 'var(--eu-super)', 'Off-peak': 'var(--eu-off)', 'Supply charge': 'var(--eu-supply)', 'Daily credit': 'var(--color-ok)'};
 const DAY_ORDER = ['Off-peak', 'Super off-peak', 'Peak'];
 
 const parseDay = d3.utcParse('%Y-%m-%d');
@@ -816,6 +1118,23 @@ const selTariff = () => {
   return p ? p.tariff : null;
 };
 const isFlat = (p) => !!p && p.peakCents === p.offPeakCents && p.offPeakCents === p.superOffPeakCents;
+// The chosen tariff's rates on the last chosen day (its newest rates if no dates are chosen).
+const selRates = () => {
+  const p = selPlan(), g = selRangeRow();
+  return p ? (g ? ratesOn(p, g.to) : p) : null;
+};
+// Remembers fn()'s result under key until the data changes; for work several drawings share.
+const memo = (() => {
+  const m = new Map();
+  return (key, fn) => {
+    const k = `${dash.gen()}|${key}`;
+    if (!m.has(k)) {
+      if (m.size > 60) m.clear();
+      m.set(k, fn());
+    }
+    return m.get(k);
+  };
+})();
 const tariffColor = (name) => {
   const i = rowsOf('plans').findIndex((p) => p.tariff === name);
   return C[3 + i] || (i === 0 ? 'var(--color-fg)' : 'var(--color-fg-muted)');
@@ -1071,8 +1390,10 @@ dash.onData(() => {
   const m = cost ? 'cost' : 'kWh';
   document.querySelectorAll('[data-measure]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.measure === m)));
   document.querySelectorAll('[data-when="cost"]').forEach((el) => { el.hidden = !cost; });
-  const plan = selPlan();
-  const flat = isFlat(plan);
+  const flat = isFlat(selRates());
+  const credit = rowsOf('bills').some((r) => r.range === selRange() && r.credit > 0);
+  document.querySelectorAll('[data-when="credit"]').forEach((el) => { el.hidden = !credit; });
+  syncInputs();
   document.querySelectorAll('[data-when="tou"]').forEach((el) => { el.hidden = flat; });
   document.querySelectorAll('[data-when="flat"]').forEach((el) => { el.hidden = !flat; });
   const multi = rowsOf('bills').filter((r) => r.range === selRange()).length > 1;
@@ -1187,18 +1508,20 @@ dash.draw('compare-bars', (el) => {
       .text(r.current ? `${r.tariff} (current)` : r.tariff);
     g.append('text').attr('class', 'eu-vlab').attr('x', W - 2).attr('y', y0 + 14).attr('text-anchor', 'end').text(money(r.total));
     const by = y0 + 22, bh = 16;
-    g.append('rect').attr('x', 0).attr('y', by).attr('height', bh).attr('width', Math.max(0, x(r.supply) - 1)).style('fill', 'var(--eu-supply)');
-    g.append('rect').attr('x', x(r.supply)).attr('y', by).attr('height', bh).attr('width', Math.max(0, x(r.total) - x(r.supply))).style('fill', tariffColor(r.tariff));
+    const fixed = Math.max(0, r.supply - (r.credit || 0));
+    g.append('rect').attr('x', 0).attr('y', by).attr('height', bh).attr('width', Math.max(0, x(fixed) - 1)).style('fill', 'var(--eu-supply)');
+    g.append('rect').attr('x', x(fixed)).attr('y', by).attr('height', bh).attr('width', Math.max(0, x(r.total) - x(fixed))).style('fill', tariffColor(r.tariff));
     g.append('rect').attr('x', 0).attr('y', y0).attr('width', W).attr('height', rowH - 4).attr('fill', 'transparent')
       .on('pointerenter pointermove', (event) => tip.show(event, r.tariff, [
         {label: 'Supply charge', value: usd(r.supply), swatch: 'var(--eu-supply)'},
         {label: 'Energy', value: usd(r.energy), swatch: tariffColor(r.tariff)},
+        ...(r.credit ? [{label: 'Daily credits', value: `−${usd(r.credit)}`}] : []),
         {label: 'Total', value: usd(r.total), strong: true},
         {label: 'Per 30 days', value: usd(r.per30)},
       ], r.vsCurrent == null ? (r.current ? 'Current tariff' : '') : `${moneySigned(r.vsCurrent)} vs current`))
       .on('pointerleave', () => tip.hide());
   });
-});
+}, {deps: ['range', 'tariff']});
 
 dash.draw('compare-rows', (tbody) => {
   const rows = rowsOf('bills').filter((r) => r.range === selRange());
@@ -1211,6 +1534,7 @@ dash.draw('compare-rows', (tbody) => {
       nameCell(r.tariff, r.current ? 'Current' : r.rank === 1 ? 'Cheapest' : null, tariffColor(r.tariff)),
       cell(money(r.supply), 'eu-num'),
       cell(money(r.energy), 'eu-num'),
+      Object.assign(cell(r.credit ? `−${money(r.credit)}` : '—', 'eu-num'), {hidden: !rows.some((x) => x.credit > 0)}),
       cell(money(r.total), 'eu-num eu-strong'),
       cell(money(r.per30), 'eu-num'),
       cell(f1(r.avgCents), 'eu-num'),
@@ -1291,22 +1615,32 @@ dash.draw('compare-lines', (el) => {
       const i = Math.max(0, Math.min(dates.length - 1, Math.floor((px - ml) / x.step())));
       dash.setParams({day: dates[i]});
     });
-});
+}, {deps: ['range', 'tariff']});
 
 dash.draw('rate-rows', (tbody) => {
-  const rows = rowsOf('tariffs');
-  const plans = rowsOf('plans');
-  tbody.replaceChildren(...rows.filter((r) => String(r.tariff || '').trim() !== '').map((r) => {
-    const name = String(r.tariff).trim();
-    const plan = plans.find((p) => p.tariff === name);
+  const g = selRangeRow();
+  const cents = (v) => (v == null || Number.isNaN(v) ? '—' : f4(v * 100));
+  const rows = [];
+  for (const p of rowsOf('plans')) {
+    p.rates.forEach((r, i) => {
+      const next = p.rates[i + 1];
+      // In force during the chosen dates: starts by their end, and the next set starts after their start.
+      if (g && ((r.from && r.from > g.to) || (next && next.from <= g.from))) return;
+      rows.push({p, r});
+    });
+  }
+  tbody.replaceChildren(...rows.map(({p, r}, i) => {
     const tr = document.createElement('tr');
-    tr.dataset.key = encKey(r.tariff);
+    tr.dataset.key = `${encKey(p.tariff)},${r.from}`;
+    const first = i === 0 || rows[i - 1].p !== p;
     tr.append(
-      nameCell(name, plan && plan.current ? 'Current' : null, null),
-      cell(String(r.supply_cents_per_day ?? '—'), 'eu-num'),
-      cell(String(r.peak_cents_per_kwh ?? '—'), 'eu-num'),
-      cell(String(r.off_peak_cents_per_kwh ?? '—'), 'eu-num'),
-      cell(String(r.super_off_peak_cents_per_kwh ?? '—'), 'eu-num'),
+      first ? nameCell(p.tariff, p.current ? 'Current' : null, null) : cell(''),
+      withSort(cell(r.from ? asDate(r.from, fmtFull) : 'The start'), r.from),
+      cell(cents(r.supplyPerDay), 'eu-num'),
+      cell(cents(r.peakCents / 100), 'eu-num'),
+      cell(cents(r.offPeakCents / 100), 'eu-num'),
+      cell(cents(r.superOffPeakCents / 100), 'eu-num'),
+      cell(r.creditPerDay ? cents(r.creditPerDay) : '—', 'eu-num'),
     );
     return tr;
   }));
@@ -1348,7 +1682,7 @@ dash.draw('period-bars', (el) => {
       acc += w;
     }
   });
-});
+}, {deps: ['range', 'tariff']});
 
 dash.draw('period-rows', (tbody) => {
   const rows = forView('periods');
@@ -1358,10 +1692,10 @@ dash.draw('period-rows', (tbody) => {
     tr.append(
       nameCell(r.part, null, COLOR[r.part] || 'var(--color-fg-muted)'),
       cell(r.hours),
-      cell(`${f4(r.rate)} ${r.unit}`, 'eu-num'),
+      cell(`${r.varies ? 'avg ' : ''}${f4(r.rate)} ${r.unit}`, 'eu-num'),
       cell(r.kWh == null ? '—' : f1(r.kWh), 'eu-num'),
       cell(pct(r.kWhShare), 'eu-num'),
-      cell(money(r.cost), 'eu-num'),
+      cell(r.cost < 0 ? `−${money(-r.cost)}` : money(r.cost), 'eu-num'),
       cell(pct(r.costShare), 'eu-num'),
     );
     return tr;
@@ -1406,7 +1740,7 @@ dash.draw('daily-chart', (el) => {
   const cost = isCost();
   const totalKey = cost ? 'cost' : 'total', avgKey = cost ? 'avg7Cost' : 'avg7';
   const stack = cost
-    ? [{k: 'supply', color: 'var(--eu-supply)'}, ...[...PERIODS].reverse().map((p) => ({k: p.costKey, color: p.color}))]
+    ? [{k: 'supplyNet', color: 'var(--eu-supply)'}, ...[...PERIODS].reverse().map((p) => ({k: p.costKey, color: p.color}))]
     : [...PERIODS].reverse().map((p) => ({k: p.key, color: p.color}));
   const H = el.clientWidth < 560 ? 250 : 310;
   const top = 28, bottom = H - 24;
@@ -1464,6 +1798,7 @@ dash.draw('daily-chart', (el) => {
       hover.attr('x', slot(d.date)).attr('visibility', 'visible');
       const rows = PERIODS.map((p) => ({label: p.name, value: both(d[p.key], d[p.costKey]), swatch: p.color}));
       rows.push({label: 'Supply charge', value: usd(d.supply), swatch: 'var(--eu-supply)'});
+      if (d.credit) rows.push({label: 'Daily credit', value: `−${usd(d.credit)}`});
       rows.push({label: 'Total', value: both(d.total, d.cost), strong: true});
       if (d.avg7 != null) rows.push({label: '7-day average', value: both(d.avg7, d.avg7Cost), line: 'solid'});
       tip.show(event, asDate(d.date, fmtFull), rows, d.status);
@@ -1473,7 +1808,7 @@ dash.draw('daily-chart', (el) => {
       tip.hide();
     })
     .on('click', (event, d) => dash.setParams({day: d.date}));
-});
+}, {deps: ['range', 'tariff', 'measure', 'day']});
 
 /* ---------- Half-hour by half-hour ---------- */
 dash.draw('day-chart', (el) => {
@@ -1534,7 +1869,7 @@ dash.draw('day-chart', (el) => {
       hover.attr('visibility', 'hidden');
       tip.hide();
     });
-});
+}, {deps: ['range', 'tariff', 'measure', 'day']});
 
 /* ---------- Every half-hour ---------- */
 dash.draw('heatmap', (el) => {
@@ -1620,7 +1955,7 @@ dash.draw('heatmap', (el) => {
   max.textContent = cost ? money(hi) : f2(hi);
   leg.append(lab, ramp, max);
   el.append(leg);
-});
+}, {deps: ['range', 'tariff', 'measure', 'day']});
 
 /* ---------- An average day ---------- */
 dash.draw('profile-chart', (el) => {
@@ -1694,7 +2029,7 @@ dash.draw('profile-chart', (el) => {
       dotWe.attr('visibility', 'hidden');
       tip.hide();
     });
-});
+}, {deps: ['range', 'tariff', 'measure']});
 
 /* ---------- What moving peak use would save ---------- */
 function shiftField(name, key, show) {
@@ -1728,10 +2063,18 @@ dash.draw('month-rows', (tbody) => {
       cell(money(r.supply), 'eu-num'),
       cell(money(r.cost), 'eu-num eu-strong'),
       cell(money(r.costPerDay), 'eu-num'),
+      cell(r.kWhPerDayLastYear == null ? '—' : f1(r.kWhPerDayLastYear), 'eu-num'),
+      changeCell(r.kWhChange),
     );
     return tr;
   }));
 });
+// A percentage change, red when use went up and green when it went down.
+function changeCell(v) {
+  const td = cell(v == null ? '—' : `${fSigned(v)}%`, 'eu-num');
+  if (v != null && v !== 0) td.classList.add(v > 0 ? 'eu-bad' : 'eu-good');
+  return td;
+}
 
 /* ---------- By day of the week ---------- */
 dash.draw('weekday-chart', (el) => {
@@ -1767,7 +2110,7 @@ dash.draw('weekday-chart', (el) => {
       .attr('text-anchor', 'middle').text(vfmt(r[key]));
   }
   xLabels(svg, rows.map((r) => r.day), (d) => x(d) + x.bandwidth() / 2, H - 6, W, (d) => d);
-});
+}, {deps: ['range', 'tariff', 'measure']});
 
 /* ---------- Unusual usage ---------- */
 const ANOM_SHOWN = 12;
@@ -1788,8 +2131,12 @@ const inChosen = (rows) => {
 
 // Everything that stood out in the chosen dates, with its cost on the chosen tariff.
 function findings() {
-  const p = selPlan();
+  const p = selPlan(), g = selRangeRow();
   if (!p) return null;
+  return memo(`findings|${p.tariff}|${g ? `${g.from}|${g.to}` : ''}`, () => findingsFor(p));
+}
+function findingsFor(p) {
+  const now = selRates();
   const days = inChosen(rowsOf('usualDays'));
   const totals = new Map(forTariff('dayTotals').map((d) => [d.date, d]));
   const list = [];
@@ -1812,7 +2159,10 @@ function findings() {
       usedN: e.kWh, usualN: e.usual, diffN: e.extra,
       what: `Spike for ${duration(e.halfHours)}, up to ${f1(e.peakKW)} kW`,
       used: kwh(e.kWh, f2), usual: kwh(e.usual, f2), diff: signedKWh(e.extra, f2),
-      cost: (e.extraPeak * p.peakCents + e.extraOffPeak * p.offPeakCents + e.extraSuperOffPeak * p.superOffPeakCents) / 100,
+      cost: (() => {
+        const r = ratesOn(p, e.date);
+        return (e.extraPeak * r.peakCents + e.extraOffPeak * r.offPeakCents + e.extraSuperOffPeak * r.superOffPeakCents) / 100;
+      })(),
     });
   }
   const runs = [];
@@ -1834,13 +2184,13 @@ function findings() {
       what: `Always-on use ${f0(d3.mean(run, (d) => d.baseW))} W for ${plural(run.length, 'day')}, usually ${f0(d3.mean(run, (d) => d.usualW))} W`,
       note: `All use on those days: ${signedKWh(allDiff)} against usual`,
       used: kwh(used), usual: kwh(usual), diff: signedKWh(used - usual),
-      usedN: used, usualN: usual, diffN: used - usual, cost: (used - usual) * dayRate(p),
+      usedN: used, usualN: usual, diffN: used - usual, cost: (used - usual) * dayRate(now),
     });
   }
   list.sort((x, y) => Math.abs(y.cost || 0) - Math.abs(x.cost || 0) || (x.date < y.date ? -1 : 1));
   const flagged = days.filter((d) => d.flag);
   return {
-    list, days, plan: p,
+    list, days, plan: p, rates: now,
     judged: days.filter((d) => d.judged).length,
     high: flagged.filter((d) => d.flag === 'high').length,
     low: flagged.filter((d) => d.flag === 'low').length,
@@ -1894,7 +2244,7 @@ dash.draw('anom-base', (el) => {
   const yearKWh = (f.baseW * 24 * 365) / 1000;
   const b = (t) => { const x = document.createElement('b'); x.textContent = t; return x; };
   el.replaceChildren('Always-on use, the least the home draws at any time of day, was usually about ', b(`${f0(f.baseW)} W`),
-    '. Kept up all year that is ', b(`${f0(yearKWh)} kWh`), ', or about ', b(money0(yearKWh * dayRate(f.plan))),
+    '. Kept up all year that is ', b(`${f0(yearKWh)} kWh`), ', or about ', b(money0(yearKWh * dayRate(f.rates))),
     ` on ${f.plan.tariff}: fridges, standby, pumps and anything else that never turns off.`);
 });
 
@@ -2031,7 +2381,7 @@ dash.draw('anom-days-chart', (el) => {
       : !d.complete ? 'Some half-hours missing, so not compared' : !d.judged ? 'Not enough days around it to compare' : 'Within the usual range';
     return [rows, foot];
   });
-});
+}, {deps: ['range', 'day']});
 
 dash.draw('anom-base-chart', (el) => {
   if (placeholder(el, firstNotOk('usualDays', 'ranges'))) return;
@@ -2065,7 +2415,7 @@ dash.draw('anom-base-chart', (el) => {
     if (d.usualW != null) rows.push({label: 'Usual', value: `${f0(d.usualW)} W`, line: 'dash'});
     return [rows, d.baseRaised ? 'Raised for 3 days or more in a row' : ''];
   });
-});
+}, {deps: ['range', 'day']});
 
 dash.draw('data-checks', (ul) => {
   if (placeholder(ul, firstNotOk('dataChecks', 'ranges'))) return;
@@ -2135,6 +2485,577 @@ dash.draw('data-checks', (ul) => {
     return li;
   }));
 });
+
+/* ---------- Rates note ---------- */
+dash.draw('rates-note', (el) => {
+  const g = selRangeRow();
+  const plans = rowsOf('plans');
+  if (!g || !plans.length) { el.textContent = ''; return; }
+  const notes = [];
+  const early = plans.filter((p) => p.firstFrom && g.from < p.firstFrom);
+  if (early.length) {
+    notes.push(`The tariff list has no rates for ${listOf(early.map((p) => `${p.tariff} before ${asDate(p.firstFrom, fmtFull)}`))}, so ${early.length === 1 ? 'its' : 'their'} first rates are used for earlier days.`);
+  }
+  const changes = [...new Set(plans.flatMap((p) => p.rates.map((r) => r.from).filter((f) => f && f > g.from && f <= g.to)))].sort();
+  if (changes.length) notes.push(`Rates changed on ${listOf(changes.map((d) => asDate(d, fmtFull)))} within these dates.`);
+  el.textContent = notes.join(' ');
+});
+
+/* ---------- Your next bill ---------- */
+const addDays = (iso, n) => {
+  const t = new Date(iso + 'T00:00:00Z');
+  t.setUTCDate(t.getUTCDate() + n);
+  return t.toISOString().slice(0, 10);
+};
+const addMonths = (iso, n) => {
+  const [y, m, d] = iso.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1 + n, d)).toISOString().slice(0, 10);
+};
+// The billing period: the one chosen, else two months (Synergy bills every two) from the first day not yet billed.
+function billPeriod() {
+  const p = dash.params() || {};
+  if (p.billFrom && p.billTo && p.billFrom <= p.billTo) return {from: p.billFrom, to: p.billTo, chosen: true};
+  const all = rowsOf('ranges').find((r) => r.range === 'all');
+  if (!all) return null;
+  const u = dash.data('usage', 'all');
+  const first = (u.status === 'ok' && u.data[0] && u.data[0].unbilledFrom) || addDays(all.to, 1);
+  return {from: first, to: addDays(addMonths(first, 2), -1), chosen: false};
+}
+function nextBill() {
+  const p = selPlan(), b = billPeriod();
+  if (!p || !b) return null;
+  return memo(`bill|${p.tariff}|${b.from}|${b.to}`, () => {
+    const r = projectBill(rowsOf('dayTotals').filter((d) => d.tariff === p.tariff), p, b.from, b.to);
+    return r && Object.assign(r, {chosen: b.chosen, tariff: p.tariff});
+  });
+}
+const span2 = (a, b) => `${asDate(a, fmtFull)} – ${asDate(b, fmtFull)}`;
+
+dash.draw('nb-total', (el) => {
+  settle(el, firstNotOk('dayTotals', 'plans'));
+  const r = nextBill();
+  el.textContent = r ? money(r.total) : '—';
+});
+dash.draw('nb-period', (el) => {
+  const r = nextBill();
+  if (!r) { el.textContent = '—'; return; }
+  el.textContent = `${asDate(r.from)} – ${asDate(r.to)}${r.futureDays ? `, ${plural(r.futureDays, 'day')} to go.` : '.'}`;
+});
+dash.draw('nb-lede', (el) => {
+  const r = nextBill();
+  if (!r) { el.textContent = 'Open some readings to see this.'; return; }
+  const b = (t) => Object.assign(document.createElement('b'), {textContent: t});
+  const nodes = [];
+  if (!r.estDays) {
+    nodes.push('Every day from ', b(span2(r.from, r.to)), ' has readings: on ', b(r.tariff), ' that came to ', b(money(r.total)), ' with the supply charge.');
+  } else {
+    nodes.push('For ', b(span2(r.from, r.to)), ' on ', b(r.tariff), ': ');
+    if (r.knownDays) nodes.push(b(money(r.sofar)), ` over the ${plural(r.knownDays, 'day')} with readings, and about `);
+    else nodes.push('about ');
+    nodes.push(b(money(r.estimate)), ` for the ${r.knownDays ? 'other ' : ''}${plural(r.estDays, 'day')}${r.missingDays ? ` (${f0(r.missingDays)} of them missing from the readings)` : ''}, going by the average day from ${span2(r.basisFrom, r.basisTo)}. That makes about `,
+      b(money(r.total)), ', likely between ', b(money(r.low)), ' and ', b(money(r.high)), '.');
+  }
+  if (!r.chosen) nodes.push(' The period starts on the first day not yet billed and runs for two months, as Synergy bills; set the dates from your last bill to match it exactly.');
+  el.replaceChildren(...nodes);
+});
+dash.draw('nb-facts', (dl) => {
+  const r = nextBill();
+  if (!r) { dl.replaceChildren(); return; }
+  const fact = (label, value, sub) => {
+    const div = document.createElement('div');
+    const dt = document.createElement('dt');
+    dt.textContent = label;
+    const dd = document.createElement('dd');
+    dd.append(value);
+    if (sub) dd.append(Object.assign(document.createElement('small'), {textContent: sub}));
+    div.append(dt, dd);
+    return div;
+  };
+  dl.replaceChildren(
+    fact('Projected bill', money(r.total), `${plural(r.days, 'day')}`),
+    fact('So far', money(r.sofar), `${plural(r.knownDays, 'day')} with readings`),
+    fact('Still to come', money(r.estimate), `${plural(r.estDays, 'day')}, estimated`),
+    fact('Likely range', `${money0(r.low)}–${money0(r.high)}`, ''),
+  );
+});
+dash.draw('nb-chart', (el) => {
+  if (placeholder(el, firstNotOk('dayTotals', 'plans'))) return;
+  const r = nextBill();
+  if (!r || !r.cumulative.length) { el.replaceChildren(); return; }
+  const pts = r.cumulative;
+  const H = 220, top = 20, bottom = H - 24;
+  const {svg, W} = chartBox(el, H, `Line chart of the running total of the bill from ${asDate(r.from, fmtFull)} to ${asDate(r.to, fmtFull)}: solid where there are readings, dashed where it is estimated, with the likely range shaded.`);
+  const y = d3.scaleLinear().domain([0, d3.max(pts, (d) => d.high) || 1]).nice().range([bottom, top]);
+  const yt = y.ticks(4);
+  const fmt = axisFmt(yt, true);
+  const ml = Math.ceil(textWidth(svg, yt.map(fmt))) + 10, mr = 6;
+  const x = d3.scaleBand(pts.map((d) => d.date), [ml, W - mr]);
+  const cx = (d) => x(d) + x.bandwidth() / 2;
+  yAxis(svg, y, yt, fmt, ml, W - mr, 'Bill so far');
+  svg.append('path').datum(pts).attr('class', 'eu-band')
+    .attr('d', d3.area().x((d) => cx(d.date)).y0((d) => y(d.low)).y1((d) => y(d.high)));
+  svg.append('path').datum(pts).attr('class', 'eu-avgdash').attr('d', d3.line().x((d) => cx(d.date)).y((d) => y(d.total)));
+  svg.append('path').datum(pts).attr('class', 'eu-avg').attr('d', d3.line().defined((d) => d.actual).x((d) => cx(d.date)).y((d) => y(d.total)));
+  xLabels(svg, dateTicks(pts.map((d) => d.date), x.step()), cx, H - 6, W, (d) => asDate(d));
+  const rule = svg.append('line').attr('class', 'eu-rule').attr('y1', top).attr('y2', bottom).attr('visibility', 'hidden');
+  const tip = makeTip(el);
+  svg.append('rect').attr('class', 'eu-hit').attr('fill', 'transparent')
+    .attr('x', ml).attr('y', 0).attr('width', Math.max(0, W - mr - ml)).attr('height', bottom)
+    .on('pointerenter pointermove', (event) => {
+      const [px] = d3.pointer(event, svg.node());
+      const d = pts[Math.max(0, Math.min(pts.length - 1, Math.floor((px - ml) / x.step())))];
+      rule.attr('x1', cx(d.date)).attr('x2', cx(d.date)).attr('visibility', 'visible');
+      tip.show(event, asDate(d.date, fmtFull), [
+        {label: 'Bill so far', value: money(d.total), strong: true, line: d.actual ? 'solid' : 'dash'},
+        ...(d.actual ? [] : [{label: 'Likely range', value: `${money0(d.low)}–${money0(d.high)}`}]),
+      ], d.actual ? 'From the readings' : 'Estimated');
+    })
+    .on('pointerleave', () => { rule.attr('visibility', 'hidden'); tip.hide(); });
+}, {deps: ['tariff', 'billFrom', 'billTo']});
+
+/* ---------- Break-even ---------- */
+// The break-even rows for each other tariff against the chosen one.
+const breakEvens = () => {
+  const t = selTariff();
+  return rowsOf('breakEven').filter((r) => r.range === selRange() && r.other === t);
+};
+const beWhen = (r, field, side, fmt) => {
+  if (r[field] == null) return r.diffPerDay > 0 ? 'Always dearer' : 'Always cheaper';
+  return `Cheaper ${r[side]} ${fmt(r[field])}`;
+};
+dash.draw('be-lede', (el) => {
+  const rows = breakEvens();
+  if (!rows.length) { el.textContent = ''; return; }
+  const b = (t) => Object.assign(document.createElement('b'), {textContent: t});
+  const r0 = rows[0];
+  const nodes = [`At the rates in force on ${asDate(r0.ratesOn, fmtFull)}, with ${f1(r0.peakShareNow)}% of your use at peak and ${f1(r0.kWhPerDayNow)} kWh a day: `];
+  rows.slice(0, 3).forEach((r, i) => {
+    if (i) nodes.push(' ');
+    const dearer = r.diffPerDay > 0;
+    nodes.push(b(r.tariff), ` costs ${money(Math.abs(r.diffPerDay))} a day ${dearer ? 'more' : 'less'}`);
+    const turns = [];
+    if (r.breakEvenPeakShare != null) turns.push(`if ${r.cheaperWhenPeak === 'above' ? 'more than' : 'less than'} ${f1(r.breakEvenPeakShare)}% of your use were at peak`);
+    if (r.breakEvenKWh != null) turns.push(`if you used ${r.cheaperWhenUse === 'above' ? 'more than' : 'less than'} ${f1(r.breakEvenKWh)} kWh a day`);
+    nodes.push(turns.length ? `, and would be ${dearer ? 'cheaper' : 'dearer'} ${turns.join(', or ')}.` : ` however your use is split.`);
+  });
+  el.replaceChildren(...nodes);
+});
+dash.draw('be-rows', (tbody) => {
+  const rows = breakEvens();
+  tbody.replaceChildren(...rows.map((r) => {
+    const tr = document.createElement('tr');
+    const diff = cell(`${moneySigned(r.diffPerDay)} a day`, 'eu-num');
+    diff.classList.add(r.diffPerDay > 0 ? 'eu-bad' : 'eu-good');
+    tr.append(
+      nameCell(r.tariff, null, tariffColor(r.tariff)),
+      diff,
+      cell(beWhen(r, 'breakEvenPeakShare', 'cheaperWhenPeak', (v) => `${f1(v)}% at peak`), 'eu-num'),
+      cell(beWhen(r, 'breakEvenKWh', 'cheaperWhenUse', (v) => `${f1(v)} kWh a day`), 'eu-num'),
+    );
+    return tr;
+  }));
+});
+
+/* ---------- Battery ---------- */
+function batteryChoice() {
+  const p = dash.params() || {};
+  const num = (v, d, lo, hi) => {
+    const n = Number(v);
+    return v === '' || v == null || !Number.isFinite(n) ? d : Math.min(hi, Math.max(lo, n));
+  };
+  const price = Number(p.batPrice);
+  return {
+    size: num(p.batSize, 10, 1, 30), power: num(p.batPower, 5, 0.5, 30), efficiency: num(p.batEff, 90, 50, 100),
+    price: p.batPrice === '' || p.batPrice == null || !Number.isFinite(price) || price <= 0 ? null : price,
+  };
+}
+function battery(p) {
+  const g = selRangeRow(), c = batteryChoice();
+  if (!p || !g) return null;
+  return memo(`bat|${p.tariff}|${g.from}|${g.to}|${c.size}|${c.power}|${c.efficiency}`, () => {
+    const rows = rowsOf('halfHours').filter((r) => r.tariff === p.tariff && r.date >= g.from && r.date <= g.to)
+      .sort((a, b) => (a.date === b.date ? (a.time < b.time ? -1 : 1) : a.date < b.date ? -1 : 1));
+    return rows.length ? simulateBattery(rows, p, c) : null;
+  });
+}
+const payback = (perYear, price) => (price == null ? '—' : perYear > 0 ? `${f1(price / perYear)} years` : 'Never');
+dash.draw('bat-size-label', (el) => { el.textContent = `${f0(batteryChoice().size)} kWh`; });
+dash.draw('bat-year', (el) => {
+  const r = battery(selPlan());
+  el.textContent = r ? money0(r.savingPerYear) : '—';
+});
+dash.draw('bat-sub', (el) => {
+  const r = battery(selPlan()), c = batteryChoice();
+  if (!r) { el.textContent = '—'; return; }
+  el.textContent = `${money(r.savingPerDay)} a day, using ${f1(r.usedPerDay)} kWh a day from the battery. `
+    + (c.price == null ? 'Enter its price to see the payback.' : `Pays back ${money0(c.price)} in ${payback(r.savingPerYear, c.price)}, before any rebate or battery wear.`);
+});
+dash.draw('bat-lede', (el) => {
+  const p = selPlan(), r = battery(p), c = batteryChoice(), g = selRangeRow();
+  if (!p || !r || !g) { el.textContent = '—'; return; }
+  const b = (t) => Object.assign(document.createElement('b'), {textContent: t});
+  if (isFlat(selRates())) {
+    el.replaceChildren(b(p.tariff), ' charges the same at every hour, so a battery charged from the grid saves nothing on it. Pick a time-of-use tariff at the top to see what one would save there.');
+    return;
+  }
+  el.replaceChildren(`On `, b(p.tariff), `, a `, b(`${f0(c.size)} kWh`), ` battery charged from the grid in the cheapest hours and used from 3 pm until it runs out would have cut the energy cost over these ${plural(r.days, 'day')} from ${money(r.costBefore)} to ${money(r.costAfter)}, saving `,
+    b(money(r.saving)), ', or about ', b(`${money0(r.savingPerYear)} a year`), '. Charging from solar panels instead would save more.');
+});
+dash.draw('bat-chart', (el) => {
+  const p = selPlan(), r = battery(p);
+  if (!r) { el.replaceChildren(); return; }
+  const rows = r.profile;
+  const H = 220, top = 20, bottom = H - 24;
+  const {svg, W} = chartBox(el, H, 'Line chart of the average kWh drawn from the grid in each half-hour of the day, without a battery and with one, charging included.');
+  const y = d3.scaleLinear().domain([0, d3.max(rows, (d) => Math.max(d.before, d.after)) || 1]).nice().range([bottom, top]);
+  const yt = y.ticks(4);
+  const fmt = axisFmt(yt, false);
+  const ml = Math.ceil(textWidth(svg, yt.map(fmt))) + 10, mr = 8;
+  const x = d3.scaleLinear([0, rows.length], [ml, W - mr]);
+  const cx = (i) => x(i + 0.5);
+  yAxis(svg, y, yt, fmt, ml, W - mr, 'kWh per half-hour');
+  svg.append('path').datum(rows).attr('class', 'eu-halo').attr('d', d3.line().x((d, i) => cx(i)).y((d) => y(d.before)));
+  svg.append('path').datum(rows).attr('class', 'eu-wd').attr('d', d3.line().x((d, i) => cx(i)).y((d) => y(d.before)));
+  svg.append('path').datum(rows).attr('class', 'eu-avgdash').attr('d', d3.line().x((d, i) => cx(i)).y((d) => y(d.after)));
+  xLabels(svg, d3.range(0, rows.length + 1, W < 560 ? 12 : 6), (i) => x(i), H - 6, W, (i) => (i >= rows.length ? '24:00' : rows[i].time));
+  const tip = makeTip(el);
+  const rule = svg.append('line').attr('class', 'eu-rule').attr('y1', top).attr('y2', bottom).attr('visibility', 'hidden');
+  svg.append('rect').attr('class', 'eu-hit').attr('fill', 'transparent')
+    .attr('x', ml).attr('y', 0).attr('width', Math.max(0, W - mr - ml)).attr('height', bottom)
+    .on('pointerenter pointermove', (event) => {
+      const [px] = d3.pointer(event, svg.node());
+      const i = Math.max(0, Math.min(rows.length - 1, Math.floor(x.invert(px))));
+      rule.attr('x1', cx(i)).attr('x2', cx(i)).attr('visibility', 'visible');
+      tip.show(event, `${rows[i].time}–${endOf(rows[i].time)}`, [
+        {label: 'Without a battery', value: kwh(rows[i].before, f2), line: 'solid'},
+        {label: 'With the battery', value: kwh(rows[i].after, f2), line: 'dash'},
+      ], ratePeriod(rows[i].time));
+    })
+    .on('pointerleave', () => { rule.attr('visibility', 'hidden'); tip.hide(); });
+}, {deps: ['range', 'tariff', 'batSize', 'batPower', 'batEff']});
+dash.draw('bat-rows', (tbody) => {
+  const c = batteryChoice(), chosen = selTariff();
+  tbody.replaceChildren(...rowsOf('plans').map((p) => {
+    const r = battery(p);
+    const tr = document.createElement('tr');
+    tr.append(
+      nameCell(p.tariff, p.tariff === chosen ? 'Chosen' : null, tariffColor(p.tariff)),
+      cell(r ? money(r.costBefore) : '—', 'eu-num'),
+      cell(r ? money(r.costAfter) : '—', 'eu-num'),
+      cell(r ? money0(r.savingPerYear) : '—', 'eu-num eu-strong'),
+      cell(r ? payback(r.savingPerYear, c.price) : '—', 'eu-num'),
+    );
+    return tr;
+  }));
+});
+
+/* ---------- Time of day ---------- */
+dash.draw('tod-lede', (el) => {
+  const rows = forView('blocks');
+  if (!rows.length) { el.textContent = '—'; return; }
+  const by = new Map(rows.map((r) => [r.block, r]));
+  const ev = by.get('Early evening'), on = by.get('Overnight'), late = by.get('Late evening'), am = by.get('Morning');
+  const most = rows.reduce((m, r) => (r.avgKW > m.avgKW ? r : m));
+  const b = (t) => Object.assign(document.createElement('b'), {textContent: t});
+  el.replaceChildren(
+    'The early evening, 3–9 pm, used ', b(`${f1(ev.kWhPerDay)} kWh a day`), ` (${f0(ev.kWhShare)}% of the total) and made up `, b(`${f0(ev.costShare)}%`), ' of the energy cost. ',
+    'Overnight, 12–6 am, used ', b(`${f1(on.kWhPerDay)} kWh`), ', the late evening, 9 pm–midnight, ', b(`${f1(late.kWhPerDay)} kWh`), ', and the morning, 6–9 am, ', b(`${f1(am.kWhPerDay)} kWh`), ' a day. ',
+    `The home drew the most in the ${most.block.toLowerCase()}, `, b(`${f2(most.avgKW)} kW`), ' on average.');
+});
+dash.draw('tod-chart', (el) => {
+  if (placeholder(el, firstNotOk('blocks', 'plans'))) return;
+  const rows = forView('blocks');
+  if (!rows.length) { el.replaceChildren(); return; }
+  const cost = isCost();
+  const key = cost ? 'costPerDay' : 'kWhPerDay';
+  const rowH = 34, H = rows.length * rowH + 4;
+  const {svg, W} = chartBox(el, H, `Bar chart of the ${cost ? 'energy cost' : 'kWh'} a day in each part of the day, coloured by rate period.`);
+  const labels = rows.map((r) => `${r.block}, ${r.hours}`);
+  const ml = Math.ceil(textWidth(svg, labels)) + 12;
+  const fmtV = cost ? money : (v) => `${f1(v)} kWh`;
+  const mr = Math.ceil(textWidth(svg, rows.map((r) => fmtV(r[key])), 'eu-vlab')) + 10;
+  const x = d3.scaleLinear([0, d3.max(rows, (r) => r[key]) || 1], [ml, W - mr]);
+  const tip = makeTip(el);
+  rows.forEach((r, i) => {
+    const y0 = 2 + i * rowH;
+    svg.append('g').attr('class', 'eu-axis').append('text').attr('x', 0).attr('y', y0 + 12).attr('dy', '0.32em').text(labels[i]);
+    svg.append('rect').attr('x', ml).attr('y', y0 + 2).attr('height', 20).attr('width', Math.max(0, x(r[key]) - ml))
+      .style('fill', COLOR[r.period])
+      .on('pointerenter pointermove', (event) => tip.show(event, `${r.block}, ${r.hours}`, [
+        {label: 'kWh a day', value: f2(r.kWhPerDay)},
+        {label: 'Share of kWh', value: pct(r.kWhShare)},
+        {label: 'Energy cost a day', value: money(r.costPerDay)},
+        {label: 'Share of cost', value: pct(r.costShare)},
+        {label: 'Average power', value: `${f2(r.avgKW)} kW`},
+      ], r.period))
+      .on('pointerleave', () => tip.hide());
+    svg.append('text').attr('class', 'eu-vlab').attr('x', x(r[key]) + 6).attr('y', y0 + 12).attr('dy', '0.32em').text(fmtV(r[key]));
+  });
+}, {deps: ['range', 'tariff', 'measure']});
+dash.draw('tod-rows', (tbody) => {
+  tbody.replaceChildren(...forView('blocks').map((r) => {
+    const tr = document.createElement('tr');
+    tr.append(
+      nameCell(r.block, null, COLOR[r.period]),
+      cell(r.hours),
+      cell(f2(r.kWhPerDay), 'eu-num'),
+      cell(pct(r.kWhShare), 'eu-num'),
+      cell(money(r.costPerDay), 'eu-num'),
+      cell(pct(r.costShare), 'eu-num'),
+      cell(f2(r.avgKW), 'eu-num'),
+    );
+    return tr;
+  }));
+});
+
+/* ---------- Where the cost concentrates ---------- */
+const hourName = (h) => {
+  const x = ((h % 24) + 24) % 24;
+  return x === 0 ? 'midnight' : x === 12 ? 'noon' : x < 12 ? `${x} am` : `${x - 12} pm`;
+};
+dash.draw('conc-lede', (el) => {
+  const r = forView('concentration')[0];
+  if (!r) { el.textContent = '—'; return; }
+  const t10 = r.tops.find((x) => x.pct === 10), t25 = r.tops.find((x) => x.pct === 25);
+  const lead = Object.entries(r.periodShare).sort((a, b) => b[1] - a[1])[0];
+  const b = (t) => Object.assign(document.createElement('b'), {textContent: t});
+  const nodes = ['The dearest 10% of half-hours, ', b(`${f0(t10.halfHours / 2)} hours`), ', made up ', b(`${f0(t10.costShare)}%`), ` of the energy cost while using ${f0(t10.kWhShare)}% of the kWh, and the dearest quarter made up ${f0(t25.costShare)}%. `];
+  nodes.push(`${f0(lead[1])}% of that dearest 10% was in the ${lead[0].toLowerCase()} period`);
+  if (r.topHours.length) nodes.push(`, most often from ${hourName(r.topHours[0].hour)} to ${hourName(r.topHours[0].hour + 1)}`);
+  nodes.push('. Cutting back in those half-hours does the most for the bill.');
+  el.replaceChildren(...nodes);
+});
+dash.draw('conc-chart', (el) => {
+  if (placeholder(el, firstNotOk('concentration', 'plans'))) return;
+  const r = forView('concentration')[0];
+  if (!r) { el.replaceChildren(); return; }
+  const H = 250, top = 28, bottom = H - 24;
+  const {svg, W} = chartBox(el, H, 'Curve of the share of the energy cost against the share of half-hours, adding them up from the dearest, with a dashed diagonal for if every half-hour cost the same.');
+  const y = d3.scaleLinear([0, 100], [bottom, top]);
+  const yt = [0, 25, 50, 75, 100];
+  const fmt = (v) => `${v}%`;
+  const ml = Math.ceil(textWidth(svg, yt.map(fmt))) + 10, mr = 10;
+  const x = d3.scaleLinear([0, 100], [ml, W - mr]);
+  yAxis(svg, y, yt, fmt, ml, W - mr, 'Share of energy cost');
+  svg.append('line').attr('class', 'eu-usual').attr('x1', x(0)).attr('y1', y(0)).attr('x2', x(100)).attr('y2', y(100));
+  const pts = r.curve.map((v, i) => [i, v]);
+  svg.append('path').datum(pts).attr('class', 'eu-halo').attr('d', d3.line().x((d) => x(d[0])).y((d) => y(d[1])));
+  svg.append('path').datum(pts).attr('class', 'eu-wd').attr('d', d3.line().x((d) => x(d[0])).y((d) => y(d[1])));
+  const t10 = r.curve[10];
+  svg.append('line').attr('class', 'eu-ref').attr('x1', x(10)).attr('x2', x(10)).attr('y1', y(0)).attr('y2', y(t10));
+  svg.append('circle').attr('class', 'eu-dot').attr('cx', x(10)).attr('cy', y(t10)).attr('r', 4);
+  svg.append('text').attr('class', 'eu-vlab').attr('x', x(10) + 8).attr('y', y(t10) + 4).text(`dearest 10%: ${f0(t10)}% of the cost`);
+  xLabels(svg, [0, 25, 50, 75, 100], (v) => x(v), H - 6, W, (v) => (v ? `${v}% of half-hours` : 'Dearest first'));
+  const dot = svg.append('circle').attr('class', 'eu-dot').attr('r', 3.5).attr('visibility', 'hidden');
+  const tip = makeTip(el);
+  svg.append('rect').attr('class', 'eu-hit').attr('fill', 'transparent')
+    .attr('x', ml).attr('y', 0).attr('width', Math.max(0, W - mr - ml)).attr('height', bottom)
+    .on('pointerenter pointermove', (event) => {
+      const [px] = d3.pointer(event, svg.node());
+      const i = Math.max(0, Math.min(100, Math.round(x.invert(px))));
+      dot.attr('cx', x(i)).attr('cy', y(r.curve[i])).attr('visibility', 'visible');
+      tip.show(event, `The dearest ${i}% of half-hours`, [
+        {label: 'Hours', value: f0((r.halfHours * i) / 100 / 2)},
+        {label: 'Share of energy cost', value: `${f1(r.curve[i])}%`, strong: true},
+      ], '');
+    })
+    .on('pointerleave', () => { dot.attr('visibility', 'hidden'); tip.hide(); });
+}, {deps: ['range', 'tariff']});
+dash.draw('conc-rows', (tbody) => {
+  const r = forView('concentration')[0];
+  tbody.replaceChildren(...(r ? r.tops : []).map((x) => {
+    const tr = document.createElement('tr');
+    tr.append(
+      cell(`Dearest ${x.pct}%`),
+      cell(f0(x.halfHours / 2), 'eu-num'),
+      cell(pct(x.costShare), 'eu-num eu-strong'),
+      cell(pct(x.kWhShare), 'eu-num'),
+      cell(money(x.cost), 'eu-num'),
+    );
+    return tr;
+  }));
+});
+
+/* ---------- Peak demand ---------- */
+dash.draw('dem-lede', (el) => {
+  const days = inChosen(rowsOf('demand')).filter((d) => d.halfHours >= 40);
+  if (!days.length) { el.textContent = '—'; return; }
+  const top = days.reduce((m, d) => (d.peakKW > m.peakKW ? d : m));
+  const typical = d3.median(days, (d) => d.peakKW), avg = d3.mean(days, (d) => d.avgKW);
+  const atPeak = days.filter((d) => d.period === 'Peak').length / days.length;
+  const b = (t) => Object.assign(document.createElement('b'), {textContent: t});
+  el.replaceChildren('The busiest half-hour in these dates was ', b(`${top.time}–${endOf(top.time)} on ${asDate(top.date, fmtDay)}`), ', averaging ', b(`${f1(top.peakKW)} kW`),
+    '. On a typical day the busiest half-hour averages ', b(`${f1(typical)} kW`), `, while across the whole day the home draws ${f2(avg)} kW, about ${f0((avg / typical) * 100)}% of that peak. `,
+    `On ${f0(atPeak * 100)}% of days the busiest half-hour was at peak, 3–9 pm. This is what sizes a battery’s power, or shows when big loads overlap.`);
+});
+dash.draw('dem-chart', (el) => {
+  if (placeholder(el, firstNotOk('demand', 'ranges'))) return;
+  const days = inChosen(rowsOf('demand'));
+  if (!days.length) { el.replaceChildren(); return; }
+  const H = el.clientWidth < 560 ? 220 : 250, top = 20, bottom = H - 24;
+  const {svg, W} = chartBox(el, H, `Bar chart of the average power in each day’s busiest half-hour from ${asDate(days[0].date)} to ${asDate(days[days.length - 1].date)}, coloured by the rate period it fell in, with a dashed line for the typical day.`);
+  const y = d3.scaleLinear().domain([0, d3.max(days, (d) => d.peakKW) || 1]).nice().range([bottom, top]);
+  const yt = y.ticks(4);
+  const fmt = d3.format(',.1f');
+  const ml = Math.ceil(textWidth(svg, yt.map(fmt))) + 10, mr = 6;
+  const {x, cx} = anomAxisX(svg, days, W, ml, mr);
+  yAxis(svg, y, yt, fmt, ml, W - mr, 'kW');
+  svg.append('g').selectAll('rect').data(days).join('rect')
+    .attr('x', (d) => x(d.date)).attr('width', x.bandwidth()).attr('y', (d) => y(d.peakKW)).attr('height', (d) => Math.max(0, y(0) - y(d.peakKW)))
+    .style('fill', (d) => COLOR[d.period] || 'var(--color-fg-muted)');
+  const med = d3.median(days, (d) => d.peakKW);
+  svg.append('line').attr('class', 'eu-usual').attr('x1', ml).attr('x2', W - mr).attr('y1', y(med)).attr('y2', y(med));
+  xLabels(svg, dateTicks(days.map((d) => d.date), x.step()), cx, H - 6, W, (d) => asDate(d));
+  anomHits(svg, el, days, x, top, bottom, (d) => [[
+    {label: 'Busiest half-hour', value: `${f2(d.peakKW)} kW`, strong: true, swatch: COLOR[d.period]},
+    {label: 'Starting', value: d.time},
+    {label: 'Average over the day', value: `${f2(d.avgKW)} kW`},
+  ], d.halfHours < 48 ? 'Some half-hours missing' : d.period]);
+}, {deps: ['range', 'day']});
+dash.draw('dem-hours', (el) => {
+  if (placeholder(el, firstNotOk('demand', 'ranges'))) return;
+  const days = inChosen(rowsOf('demand'));
+  if (!days.length) { el.replaceChildren(); return; }
+  const counts = d3.range(24).map((h) => ({h, n: days.filter((d) => Number(d.time.slice(0, 2)) === h).length, period: ratePeriod(`${String(h).padStart(2, '0')}:00`)}));
+  const H = el.clientWidth < 560 ? 220 : 250, top = 20, bottom = H - 24;
+  const {svg, W} = chartBox(el, H, 'Bar chart of how many days had their busiest half-hour starting in each hour of the day, coloured by rate period.');
+  const y = d3.scaleLinear().domain([0, d3.max(counts, (c) => c.n) || 1]).nice().range([bottom, top]);
+  const yt = y.ticks(4).filter(Number.isInteger);
+  const fmt = d3.format(',.0f');
+  const ml = Math.ceil(textWidth(svg, yt.map(fmt))) + 10, mr = 6;
+  const x = d3.scaleBand(counts.map((c) => c.h), [ml, W - mr]).paddingInner(0.2);
+  yAxis(svg, y, yt, fmt, ml, W - mr, 'Days');
+  const tip = makeTip(el);
+  svg.append('g').selectAll('rect').data(counts).join('rect')
+    .attr('x', (c) => x(c.h)).attr('width', x.bandwidth()).attr('y', (c) => y(c.n)).attr('height', (c) => Math.max(0, y(0) - y(c.n)))
+    .style('fill', (c) => COLOR[c.period])
+    .on('pointerenter pointermove', (event, c) => tip.show(event, `${hourName(c.h)} to ${hourName(c.h + 1)}`, [{label: 'Days peaking then', value: f0(c.n), swatch: COLOR[c.period]}], c.period))
+    .on('pointerleave', () => tip.hide());
+  xLabels(svg, counts.filter((c) => c.h % (W < 560 ? 6 : 3) === 0).map((c) => c.h), (h) => x(h), H - 6, W, (h) => `${String(h).padStart(2, '0')}:00`);
+}, {deps: ['range']});
+
+/* ---------- Longer-term trend ---------- */
+// Each day's kWh or cost for the chosen tariff over the whole file, its 30-day
+// average (given when at least 20 of the 30 days have readings), and the same
+// average a year earlier.
+function trendSeries(cost) {
+  const t = selTariff();
+  return memo(`trend|${t}|${cost}`, () => {
+    const days = rowsOf('daily').filter((d) => d.tariff === t);
+    const value = new Map(days.map((d) => [d.date, cost ? d.cost : d.total]));
+    const out = days.map((d) => {
+      let sum = 0, n = 0;
+      for (let k = 0; k < 30; k += 1) {
+        const v = value.get(addDays(d.date, -k));
+        if (v != null) { sum += v; n += 1; }
+      }
+      return {date: d.date, avg: n >= 20 ? sum / n : null};
+    });
+    const avgOn = new Map(out.map((d) => [d.date, d.avg]));
+    for (const d of out) d.lastYear = avgOn.get(yearBefore(d.date)) ?? null;
+    return out;
+  });
+}
+dash.draw('trend-lede', (el) => {
+  const all = rowsOf('ranges').find((r) => r.range === 'all');
+  if (!all) { el.textContent = '—'; return; }
+  const b = (t) => Object.assign(document.createElement('b'), {textContent: t});
+  const nodes = [];
+  if (all.days < 60) {
+    el.replaceChildren('A trend needs at least 60 days of readings. Synergy exports 90 days at a time, so add older exports with ', b('Add CSV files…'), ' to build up a longer history; where they overlap, each half-hour is only counted once.');
+    return;
+  }
+  const cost = isCost();
+  const v = (n) => (cost ? `${money(n)} a day` : `${f1(n)} kWh a day`);
+  const s = trendSeries(cost).filter((d) => d.avg != null);
+  if (s.length > 1) nodes.push(`The 30-day average went from ${v(s[0].avg)} (to ${asDate(s[0].date, fmtFull)}) to `, b(v(s[s.length - 1].avg)), ` (to ${asDate(s[s.length - 1].date, fmtFull)}). `);
+  const ly = forView('lastYear')[0];
+  const say = (r, what) => {
+    nodes.push(`${what} used `, b(`${f1(r.kWhPerDay)} kWh a day`), `, ${r.kWhChange === 0 ? 'the same as' : `${f0(Math.abs(r.kWhChange))}% ${r.kWhChange > 0 ? 'more than' : 'less than'}`} the same dates a year earlier (${f1(r.prevKWhPerDay)}), and cost ${money(r.costPerDay)} a day against ${money(r.prevCostPerDay)} then, each at the rates of the time. `);
+  };
+  if (ly) say(ly, 'These dates');
+  else nodes.push('There aren’t enough readings for the same dates a year earlier to compare these dates with. ');
+  if (selRange() !== 'last365') {
+    const y = dash.data('lastYear', 'last365');
+    const r = y.status === 'ok' ? y.data.find((x) => x.tariff === selTariff()) : null;
+    if (r) say(r, 'The last 12 months');
+  }
+  el.replaceChildren(...nodes);
+});
+dash.draw('trend-chart', (el) => {
+  if (placeholder(el, firstNotOk('daily', 'plans'))) return;
+  const cost = isCost();
+  const s = trendSeries(cost);
+  if (!s.some((d) => d.avg != null)) { el.replaceChildren(); return; }
+  const g = selRangeRow();
+  const H = el.clientWidth < 560 ? 230 : 270, top = 20, bottom = H - 24;
+  const {svg, W} = chartBox(el, H, `Line chart of the 30-day average ${cost ? 'cost' : 'kWh'} a day across the whole file, with the same average a year earlier dashed and the chosen dates shaded.`);
+  const y = d3.scaleLinear().domain([0, d3.max(s, (d) => Math.max(d.avg || 0, d.lastYear || 0)) || 1]).nice().range([bottom, top]);
+  const yt = y.ticks(4);
+  const fmt = axisFmt(yt, cost);
+  const ml = Math.ceil(textWidth(svg, yt.map(fmt))) + 10, mr = 6;
+  const x = d3.scaleUtc([parseDay(s[0].date), parseDay(s[s.length - 1].date)], [ml, W - mr]);
+  const xd = (d) => x(parseDay(d));
+  if (g && (g.from > s[0].date || g.to < s[s.length - 1].date)) {
+    svg.append('rect').attr('class', 'eu-band').attr('x', xd(g.from)).attr('width', Math.max(2, xd(g.to) - xd(g.from))).attr('y', top).attr('height', bottom - top);
+  }
+  yAxis(svg, y, yt, fmt, ml, W - mr, cost ? 'Cost a day, 30-day average' : 'kWh a day, 30-day average');
+  svg.append('path').datum(s).attr('class', 'eu-avgdash').attr('d', d3.line().defined((d) => d.lastYear != null).x((d) => xd(d.date)).y((d) => y(d.lastYear)));
+  svg.append('path').datum(s).attr('class', 'eu-halo').attr('d', d3.line().defined((d) => d.avg != null).x((d) => xd(d.date)).y((d) => y(d.avg)));
+  svg.append('path').datum(s).attr('class', 'eu-avg').attr('d', d3.line().defined((d) => d.avg != null).x((d) => xd(d.date)).y((d) => y(d.avg)));
+  const ticks = x.ticks(W < 560 ? 4 : 8);
+  xLabels(svg, ticks, (d) => x(d), H - 6, W, (d) => (s.length > 400 ? fmtMonth(d) : fmtShort(d)));
+  const rule = svg.append('line').attr('class', 'eu-rule').attr('y1', top).attr('y2', bottom).attr('visibility', 'hidden');
+  const tip = makeTip(el);
+  const bis = d3.bisector((d) => d.date).center;
+  svg.append('rect').attr('class', 'eu-hit').attr('fill', 'transparent')
+    .attr('x', ml).attr('y', 0).attr('width', Math.max(0, W - mr - ml)).attr('height', bottom)
+    .on('pointerenter pointermove', (event) => {
+      const [px] = d3.pointer(event, svg.node());
+      const d = s[bis(s, x.invert(px).toISOString().slice(0, 10))];
+      rule.attr('x1', xd(d.date)).attr('x2', xd(d.date)).attr('visibility', 'visible');
+      const v = (n) => (n == null ? '—' : cost ? money(n) : `${f1(n)} kWh`);
+      tip.show(event, `30 days to ${asDate(d.date, fmtFull)}`, [
+        {label: 'Average a day', value: v(d.avg), line: 'solid', strong: true},
+        {label: 'A year earlier', value: v(d.lastYear), line: 'dash'},
+      ], '');
+    })
+    .on('pointerleave', () => { rule.attr('visibility', 'hidden'); tip.hide(); })
+    .on('click', (event) => {
+      const [px] = d3.pointer(event, svg.node());
+      dash.setParams({day: s[bis(s, x.invert(px).toISOString().slice(0, 10))].date});
+    });
+}, {deps: ['range', 'tariff', 'measure']});
+
+/* ---------- Inputs for the bill and battery ---------- */
+const BAT_INPUTS = {'bat-size': 'batSize', 'bat-power': 'batPower', 'bat-eff': 'batEff', 'bat-price': 'batPrice'};
+for (const [id, key] of Object.entries(BAT_INPUTS)) {
+  document.querySelectorAll(`#${id}`).forEach((el) => el.addEventListener('input', () => dash.setParams({[key]: el.value})));
+}
+function applyBillDates() {
+  const f = document.getElementById('nb-from'), t = document.getElementById('nb-to');
+  if (!f || !t || !f.value || !t.value || !f.validity.valid || !t.validity.valid) return;
+  const [a, b] = f.value <= t.value ? [f.value, t.value] : [t.value, f.value];
+  dash.setParams({billFrom: a, billTo: b});
+}
+document.querySelectorAll('#nb-from, #nb-to').forEach((el) => el.addEventListener('change', applyBillDates));
+document.querySelectorAll('#nb-reset').forEach((b) => b.addEventListener('click', () => dash.setParams({billFrom: '', billTo: ''})));
+// Shows the current choices in the inputs, except one being typed in.
+function syncInputs() {
+  const put = (id, v) => {
+    const el = document.getElementById(id);
+    if (el && document.activeElement !== el) el.value = v == null ? '' : String(v);
+  };
+  const c = batteryChoice();
+  put('bat-size', c.size);
+  put('bat-power', c.power);
+  put('bat-eff', c.efficiency);
+  put('bat-price', c.price);
+  const b = billPeriod();
+  if (b) { put('nb-from', b.from); put('nb-to', b.to); }
+  const reset = document.getElementById('nb-reset');
+  if (reset) reset.hidden = !(b && b.chosen);
+}
 
 /* ---------- Sortable tables ---------- */
 // Select a column heading to sort by it (numbers biggest first, words A to Z),

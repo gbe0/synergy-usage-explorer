@@ -1,7 +1,8 @@
 /*
- * app.js - everything around the dashboard: opening and checking the meter
- * CSV, the tariff editor, keeping both in this browser (IndexedDB), and the
- * offline / install plumbing. Nothing here sends data anywhere.
+ * app.js - everything around the dashboard: opening the meter and tariff
+ * CSVs (readers.js reads and checks them), the tariff editor, keeping both
+ * in this browser (IndexedDB), and the offline / install plumbing, including
+ * offering a new version. Nothing here sends data anywhere.
  */
 (function () {
   'use strict';
@@ -9,277 +10,15 @@
   // The default tariffs come from data/tariffs.csv, which stamp_version.py copies into
   // js/default-tariffs.js (a page opened from disk can't read the CSV itself).
   const DEFAULT_TARIFFS = typeof window.SYNERGY_TOOL_DEFAULT_TARIFFS === 'string' ? window.SYNERGY_TOOL_DEFAULT_TARIFFS : null;
-  const KWH_COLUMNS = ['PEAK (KWH)', 'OFF PEAK (KWH)', 'SUPER OFF PEAK (KWH)'];
-  const RATE_COLUMNS = [
-    {col: 'supply_cents_per_day', label: 'supply charge'},
-    {col: 'peak_cents_per_kwh', label: 'peak rate'},
-    {col: 'off_peak_cents_per_kwh', label: 'off-peak rate'},
-    {col: 'super_off_peak_cents_per_kwh', label: 'super off-peak rate'},
-  ];
-  const TARIFF_COLUMNS = ['tariff', 'current', ...RATE_COLUMNS.map((r) => r.col)];
+  // Reading and checking the CSV files is in readers.js, shared with the tests.
+  // start() stops with the "didn't load" note if it is missing.
+  const R = window.SynergyReaders || {};
+  const {InputError, RATE_COLUMNS, CREDIT_COLUMN, isAmount, niceDate, listNames,
+    parseIntervals, mergeIntervals, tariffDate, readTariffs, tariffsToCsv, looksLikeTariffs} = R;
   const MAX_BYTES = 50 * 1024 * 1024;
-  const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
   const $ = (sel) => document.querySelector(sel);
-  const pad2 = (n) => String(n).padStart(2, '0');
-  const niceDate = (iso) => `${Number(iso.slice(8, 10))} ${MON[Number(iso.slice(5, 7)) - 1]} ${iso.slice(0, 4)}`;
   const count = (n) => n.toLocaleString('en');
-
-  class InputError extends Error {}
-
-  /* ------------------------------------------------------------ CSV reading */
-
-  // Rows of cells (trimmed), each with the line it starts on; blank rows dropped.
-  function csvRows(text) {
-    const out = [];
-    const s = String(text || '').replace(/^\uFEFF/, '');
-    let row = [], field = '', quoted = false, line = 1, start = 1;
-    const push = () => {
-      row.push(field);
-      if (row.some((x) => x.trim() !== '')) out.push({cells: row.map((x) => x.trim()), line: start});
-      row = []; field = '';
-    };
-    for (let i = 0; i < s.length; i += 1) {
-      const c = s[i];
-      if (quoted) {
-        if (c === '"') { if (s[i + 1] === '"') { field += '"'; i += 1; } else quoted = false; }
-        else { if (c === '\n') line += 1; field += c; }
-      } else if (c === '"') quoted = true;
-      else if (c === ',') { row.push(field); field = ''; }
-      else if (c === '\n' || c === '\r') {
-        if (c === '\r' && s[i + 1] === '\n') i += 1;
-        push();
-        line += 1; start = line;
-      } else field += c;
-    }
-    if (field !== '' || row.length) push();
-    return out;
-  }
-
-  const csvCell = (v) => (/[",\r\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
-
-  // "01/09/2026", "1.9.26", "2026-09-01" -> parts; null when it isn't a date.
-  function dateParts(text) {
-    let m = /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T\s].*)?$/.exec(text);
-    if (m) return {iso: true, y: +m[1], a: +m[2], b: +m[3]};
-    m = /^(\d{1,2})[/.](\d{1,2})[/.](\d{4}|\d{2})(?:\s.*)?$/.exec(text);
-    if (!m) return null;
-    let y = +m[3];
-    if (y < 100) y += 2000;
-    return {iso: false, a: +m[1], b: +m[2], y};
-  }
-  function isoDate(y, month, day) {
-    const t = new Date(Date.UTC(y, month - 1, day));
-    if (t.getUTCFullYear() !== y || t.getUTCMonth() !== month - 1 || t.getUTCDate() !== day) return null;
-    return `${y}-${pad2(month)}-${pad2(day)}`;
-  }
-
-  /*
-   * Reads one meter interval CSV into half-hour rows. order ('dmy' or 'mdy')
-   * only matters when every date in the file could be read either way.
-   * Header rows repeated part-way down (files joined by hand) are skipped.
-   */
-  function parseIntervals(text, order, name) {
-    const rows = csvRows(text);
-    if (!rows.length) throw new InputError(`${name} is empty.`);
-    const head = rows[0].cells.map((h) => h.toUpperCase());
-    const col = (h) => head.indexOf(h);
-    const missing = ['DATE', 'TIME', ...KWH_COLUMNS].filter((h) => col(h) < 0);
-    if (missing.length) {
-      throw new InputError(`${name} isn't a meter interval file: it has no ${missing.join(', ')} column. `
-        + `Its columns are: ${rows[0].cells.filter(Boolean).join(', ') || 'none'}.`);
-    }
-    const iDate = col('DATE'), iTime = col('TIME'), iStatus = col('BILLING STATUS');
-    const iKwh = KWH_COLUMNS.map(col);
-    const body = rows.slice(1).filter((r) => (r.cells[iDate] || '').toUpperCase() !== 'DATE');
-    const repeatedHeaders = rows.length - 1 - body.length;
-    if (!body.length) throw new InputError(`${name} has a header row but no readings.`);
-
-    // Work out the date order from the dates themselves where possible.
-    let maxA = 0, maxB = 0, slash = false;
-    const parts = body.map((r) => {
-      const p = dateParts(r.cells[iDate] || '');
-      if (!p) throw new InputError(`${name}, line ${r.line}: "${r.cells[iDate] || ''}" is not a date.`);
-      if (!p.iso) { slash = true; maxA = Math.max(maxA, p.a); maxB = Math.max(maxB, p.b); }
-      return p;
-    });
-    if (maxA > 12 && maxB > 12) throw new InputError(`${name}: the dates mix day/month and month/day order, so they can't be read.`);
-    const ambiguous = slash && maxA <= 12 && maxB <= 12;
-    const used = maxA > 12 ? 'dmy' : maxB > 12 ? 'mdy' : order === 'mdy' ? 'mdy' : 'dmy';
-
-    let readings = 0;
-    const out = body.map((r, n) => {
-      const p = parts[n];
-      const [month, day] = p.iso ? [p.a, p.b] : used === 'mdy' ? [p.a, p.b] : [p.b, p.a];
-      const date = isoDate(p.y, month, day);
-      if (!date) throw new InputError(`${name}, line ${r.line}: "${r.cells[iDate]}" is not a real date${p.iso ? '' : ` when read as ${used === 'mdy' ? 'month/day' : 'day/month'}`}.`);
-      const tm = /^(\d{1,2}):(\d{2})(?::\d{2}(?:\.\d+)?)?$/.exec(r.cells[iTime] || '');
-      if (!tm || +tm[1] > 23 || +tm[2] > 59) throw new InputError(`${name}, line ${r.line}: "${r.cells[iTime] || ''}" is not a time like 13:30.`);
-      const values = iKwh.map((i, k) => {
-        const v = (r.cells[i] || '').replace(/^\+/, '');
-        if (v === '') return '';
-        if (!/^-?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i.test(v)) throw new InputError(`${name}, line ${r.line}: "${r.cells[i]}" under ${KWH_COLUMNS[k]} is not a number of kWh.`);
-        readings += 1;
-        return String(Number(v));
-      });
-      const status = iStatus >= 0 ? (r.cells[iStatus] || '').replace(/[",\r\n]/g, ' ') : 'Billed';
-      return {date, time: `${pad2(+tm[1])}:${tm[2]}`, values, status};
-    });
-    if (!readings) throw new InputError(`${name} has no kWh readings: the PEAK, OFF PEAK and SUPER OFF PEAK columns are empty.`);
-    return {name, rows: out, ambiguous, order: used, hasStatus: iStatus >= 0, repeatedHeaders};
-  }
-
-  const HALF_HOURS = Array.from({length: 48}, (_, i) => `${pad2(Math.floor(i / 2))}:${i % 2 ? '30' : '00'}`);
-  const halfHourEnd = (t) => HALF_HOURS[(HALF_HOURS.indexOf(t) + 1) % 48];
-  const WEEKDAY = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-  const dayName = (iso) => `${WEEKDAY[new Date(`${iso}T00:00:00Z`).getUTCDay()]} ${niceDate(iso)}`;
-
-  // Runs of missing half-hours between 00:00 on the first day and 23:30 on the last.
-  function findGaps(has, first, last) {
-    const gaps = [];
-    let run = null;
-    for (let t = Date.parse(first); t <= Date.parse(last); t += 86400000) {
-      const date = new Date(t).toISOString().slice(0, 10);
-      for (const time of HALF_HOURS) {
-        if (has(date, time)) { run = null; continue; }
-        if (run) { run.toDate = date; run.toTime = time; run.n += 1; }
-        else { run = {fromDate: date, fromTime: time, toDate: date, toTime: time, n: 1}; gaps.push(run); }
-      }
-    }
-    return gaps;
-  }
-  function describeGap(g) {
-    const whole = g.fromTime === '00:00' && g.toTime === '23:30';
-    if (whole && g.fromDate === g.toDate) return `${dayName(g.fromDate)} (the whole day)`;
-    if (whole) return `${dayName(g.fromDate)} – ${dayName(g.toDate)} (${count(g.n / 48)} whole days)`;
-    if (g.fromDate === g.toDate) return `${dayName(g.fromDate)}, ${g.fromTime}–${halfHourEnd(g.toTime)}`;
-    return `${dayName(g.fromDate)} ${g.fromTime} – ${dayName(g.toDate)} ${halfHourEnd(g.toTime)}`;
-  }
-
-  const listNames = (names) => (names.length < 2 ? names.join('')
-    : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`);
-
-  /*
-   * Combines parsed files into the one layout dashboard.js reads (DD/MM/YYYY
-   * dates), counting every half-hour once. When the same half-hour appears
-   * more than once (overlapping exports, or files joined by hand), a billed
-   * reading beats one not yet billed; otherwise the copy from the file whose
-   * readings run latest wins, and within one file the later row.
-   */
-  function mergeIntervals(parsed) {
-    const ranked = parsed
-      .map((p, i) => ({p, i, last: p.rows.reduce((m, r) => (r.date > m ? r.date : m), '')}))
-      .sort((x, y) => (x.last < y.last ? -1 : x.last > y.last ? 1 : x.i - y.i));
-    const byKey = new Map();
-    const repeated = new Set(), differing = new Set();
-    for (const {p} of ranked) {
-      for (const r of p.rows) {
-        const key = `${r.date} ${r.time}`;
-        const had = byKey.get(key);
-        if (had) {
-          repeated.add(key);
-          if (had.values.join() !== r.values.join()) differing.add(key);
-          if (had.status === 'Billed' && r.status !== 'Billed') continue;
-        }
-        byKey.set(key, r);
-      }
-    }
-    const keys = [...byKey.keys()].sort();
-    const lines = ['Date,Time,PEAK (KWH),OFF PEAK (KWH),SUPER OFF PEAK (KWH),Billing Status'];
-    const dates = new Set();
-    for (const key of keys) {
-      const r = byKey.get(key);
-      dates.add(r.date);
-      lines.push([`${r.date.slice(8, 10)}/${r.date.slice(5, 7)}/${r.date.slice(0, 4)}`, r.time, ...r.values, r.status].join(','));
-    }
-    const days = [...dates].sort();
-
-    const gaps = findGaps((date, time) => byKey.has(`${date} ${time}`), days[0], days[days.length - 1]);
-    const missing = gaps.reduce((n, g) => n + g.n, 0);
-
-    const files = parsed.map((p) => {
-      const own = new Set(p.rows.map((r) => `${r.date} ${r.time}`));
-      const ds = p.rows.map((r) => r.date).sort();
-      return {name: p.name, halfHours: own.size, first: ds[0], last: ds[ds.length - 1]};
-    });
-    const notes = [];
-    const many = parsed.length > 1;
-    for (const p of parsed.filter((x) => !x.hasStatus)) {
-      notes.push(many ? `${p.name} has no Billing Status column, so its readings count as billed.`
-        : 'There is no Billing Status column, so every reading counts as billed.');
-    }
-    const joined = parsed.filter((p) => p.repeatedHeaders);
-    if (joined.length) notes.push(`${listNames(joined.map((p) => p.name))} ${joined.length > 1 ? 'repeat' : 'repeats'} the header row part-way down, as files joined by hand do; the extra header rows were skipped.`);
-    const ambiguous = parsed.some((p) => p.ambiguous);
-    if (ambiguous) {
-      const used = parsed.find((p) => p.ambiguous).order;
-      notes.push(`Every date in ${many ? listNames(parsed.filter((p) => p.ambiguous).map((p) => p.name)) : 'the file'} could be read as day/month or as month/day. They are read as ${used === 'mdy' ? 'month/day' : 'day/month'}; change this under “Dates are” if that’s wrong.`);
-    }
-    if (repeated.size) {
-      let note = `${count(repeated.size)} half-hour${repeated.size === 1 ? '' : 's'} appear${repeated.size === 1 ? 's' : ''} more than once`
-        + `${many ? ' across the files' : ' in the file'} and ${repeated.size === 1 ? 'is' : 'are'} counted once.`;
-      if (differing.size) {
-        note += ` ${count(differing.size)} of them ${differing.size === 1 ? 'has' : 'have'} different readings in different copies; the billed reading is used, or else the one from the file whose readings run latest.`;
-      }
-      notes.push(note);
-    }
-    if (missing) {
-      const shown = gaps.slice(0, 4).map(describeGap);
-      notes.unshift(`${count(missing)} half-hour${missing === 1 ? ' is' : 's are'} missing between the first and last day, `
-        + `in ${count(gaps.length)} gap${gaps.length === 1 ? '' : 's'}: ${shown.join('; ')}${gaps.length > 4 ? `; and ${count(gaps.length - 4)} more` : ''}. `
-        + 'Nothing is counted for those times, so use and costs there are understated; Data checks lists the gaps in the chosen dates.');
-    }
-    return {
-      csv: lines.join('\n') + '\n', halfHours: keys.length, missing, gaps: gaps.length, first: days[0], last: days[days.length - 1], days: days.length,
-      notes, ambiguous, order: ambiguous ? parsed.find((p) => p.ambiguous).order : 'dmy', files, overlaps: repeated.size, differing: differing.size,
-    };
-  }
-
-  const isAmount = (v) => /^(\d+\.?\d*|\.\d+)$/.test(v);
-
-  // Checks a tariffs CSV; returns {tariffs: [{tariff, current, <rate columns as text>}], notes}.
-  function readTariffs(text, name) {
-    const rows = csvRows(text);
-    if (!rows.length) throw new InputError(`${name} is empty.`);
-    const head = rows[0].cells.map((h) => h.toLowerCase());
-    const missing = TARIFF_COLUMNS.filter((c) => !head.includes(c));
-    if (missing.length) throw new InputError(`${name} has no ${missing.join(', ')} column.`);
-    const tariffs = [];
-    const names = new Set();
-    for (const r of rows.slice(1)) {
-      const get = (c) => r.cells[head.indexOf(c)] || '';
-      const t = {tariff: get('tariff'), current: get('current').toLowerCase() === 'yes'};
-      if (!t.tariff) continue;
-      if (names.has(t.tariff.toLowerCase())) throw new InputError(`${name}, line ${r.line}: “${t.tariff}” is listed twice.`);
-      names.add(t.tariff.toLowerCase());
-      for (const {col, label} of RATE_COLUMNS) {
-        const v = get(col);
-        if (!isAmount(v)) throw new InputError(`${name}, line ${r.line}: the ${label} for “${t.tariff}” (${col}) is “${v}”, not a number of cents.`);
-        t[col] = v;
-      }
-      tariffs.push(t);
-    }
-    if (!tariffs.length) throw new InputError(`${name} lists no tariffs.`);
-    const notes = [];
-    const current = tariffs.filter((t) => t.current);
-    if (!current.length) {
-      tariffs[0].current = true;
-      notes.push(`No tariff was marked current, so “${tariffs[0].tariff}” is treated as current.`);
-    } else if (current.length > 1) {
-      current.slice(1).forEach((t) => { t.current = false; });
-      notes.push(`More than one tariff was marked current; “${current[0].tariff}” is used.`);
-    }
-    return {tariffs, notes};
-  }
-
-  const tariffsToCsv = (list) => [TARIFF_COLUMNS.join(',')]
-    .concat(list.map((t) => [csvCell(t.tariff), t.current ? 'yes' : 'no', ...RATE_COLUMNS.map((r) => t[r.col])].join(',')))
-    .join('\n') + '\n';
-
-  const looksLikeTariffs = (text) => {
-    const first = csvRows(String(text).slice(0, 2000))[0];
-    return !!first && first.cells.some((c) => c.toLowerCase() === 'supply_cents_per_day');
-  };
 
   /* ------------------------------------------------------------ storage */
 
@@ -592,35 +331,54 @@
 
   /* ------------------------------------------------------------ tariff editor */
 
+  // Each tariff is a card (template #tariff-card) holding one box per set of
+  // rates (template #tariff-period), oldest first. syncTariffCards() keeps
+  // their numbering, ids and labels right after any change.
   const dialog = () => $('#tariff-dialog');
+  const periodColumns = () => [...RATE_COLUMNS, CREDIT_COLUMN];
 
-  function tariffCard(t, i) {
+  function periodBox(p) {
+    const box = $('#tariff-period').content.firstElementChild.cloneNode(true);
+    box.querySelector('[data-col="from"]').value = p.from || '';
+    for (const {col} of periodColumns()) box.querySelector(`[data-col="${col}"]`).value = p[col] || '';
+    return box;
+  }
+
+  function tariffCard(t) {
     const card = $('#tariff-card').content.firstElementChild.cloneNode(true);
-    card.querySelector('legend').textContent = `Tariff ${i + 1}`;
     card.querySelector('[name="tariff"]').value = t.tariff;
-    const radio = card.querySelector('[name="current"]');
-    radio.checked = !!t.current;
-    for (const {col} of RATE_COLUMNS) card.querySelector(`[data-col="${col}"]`).value = t[col] || '';
-    // Give every input an id so the labels and error messages can point at it.
-    card.querySelectorAll('input').forEach((input) => {
-      const key = input.name === 'current' ? 'current' : input.dataset.col || 'name';
-      input.id = `tariff-${i}-${key}`;
-    });
-    card.querySelector('.app-remove').setAttribute('aria-label', `Remove ${t.tariff || `tariff ${i + 1}`}`);
+    card.querySelector('[name="current"]').checked = !!t.current;
+    card.querySelector('.app-periods').append(...(t.rates && t.rates.length ? t.rates : [{}]).map(periodBox));
     return card;
   }
 
   function renderTariffCards(list) {
-    const box = $('#tariff-list');
-    box.replaceChildren(...list.map(tariffCard));
+    $('#tariff-list').replaceChildren(...list.map(tariffCard));
     syncTariffCards();
   }
 
   function syncTariffCards() {
     const cards = [...document.querySelectorAll('#tariff-list .app-tariff')];
-    cards.forEach((c, i) => {
-      c.querySelector('legend').textContent = `Tariff ${i + 1}`;
-      c.querySelector('.app-remove').disabled = cards.length < 2;
+    cards.forEach((card, i) => {
+      const nameInput = card.querySelector('[name="tariff"]');
+      const name = nameInput.value.trim() || `tariff ${i + 1}`;
+      card.querySelector(':scope > legend').textContent = `Tariff ${i + 1}`;
+      // Ids follow each field's place, so they stay unique as tariffs and rates come and go.
+      nameInput.id = `tariff-${i}-name`;
+      card.querySelector('[name="current"]').id = `tariff-${i}-current`;
+      const remove = card.querySelector('.app-remove');
+      remove.disabled = cards.length < 2;
+      remove.setAttribute('aria-label', `Remove ${name}`);
+      const periods = [...card.querySelectorAll('.app-period')];
+      periods.forEach((box, n) => {
+        box.querySelector(':scope > legend').textContent = periods.length > 1 ? `Rates ${n + 1}` : 'Rates';
+        // Only the first set of rates can do without a start date.
+        box.querySelector('.app-field-from span').textContent = n ? 'From' : 'From (optional)';
+        box.querySelectorAll('input').forEach((input) => { input.id = `tariff-${i}-${n}-${input.dataset.col}`; });
+        const rm = box.querySelector('.app-period-remove');
+        rm.hidden = periods.length < 2;
+        rm.setAttribute('aria-label', `Remove rates ${n + 1} of ${name}`);
+      });
     });
     if (cards.length && !cards.some((c) => c.querySelector('[name="current"]').checked)) {
       cards[0].querySelector('[name="current"]').checked = true;
@@ -635,37 +393,65 @@
     p.hidden = !text;
   }
 
-  // Reads the editor; returns {list} or {error, input}.
+  // Reads the editor; returns {list} or {error, input}. Follows readTariffs's rules.
   function collectTariffs() {
-    document.querySelectorAll('#tariff-list [aria-invalid]').forEach((el) => el.removeAttribute('aria-invalid'));
+    document.querySelectorAll('#tariff-list [aria-invalid]').forEach((el) => {
+      el.removeAttribute('aria-invalid');
+      el.removeAttribute('aria-describedby');
+    });
     const list = [];
-    const names = new Map();
+    const names = new Set();
     for (const card of document.querySelectorAll('#tariff-list .app-tariff')) {
       const nameInput = card.querySelector('[name="tariff"]');
       const name = nameInput.value.trim();
       if (!name) return {error: 'Give each tariff a name.', input: nameInput};
       if (names.has(name.toLowerCase())) return {error: `Two tariffs are called “${name}”. Give them different names.`, input: nameInput};
-      names.set(name.toLowerCase(), true);
-      const t = {tariff: name, current: card.querySelector('[name="current"]').checked};
-      for (const {col, label} of RATE_COLUMNS) {
-        const input = card.querySelector(`[data-col="${col}"]`);
-        const v = input.value.trim().replace(/^0+(?=\d)/, '');
-        if (v === '') return {error: `Fill in the ${label} for “${name}”.`, input};
-        if (!isAmount(v)) return {error: `The ${label} for “${name}” should be a number of cents, like 24.3431.`, input};
-        t[col] = v;
+      names.add(name.toLowerCase());
+      const t = {tariff: name, current: card.querySelector('[name="current"]').checked, rates: []};
+      const periods = [...card.querySelectorAll('.app-period')];
+      for (const [n, box] of periods.entries()) {
+        const fromInput = box.querySelector('[data-col="from"]');
+        const from = fromInput.value;
+        const which = periods.length > 1 ? ` (rates ${n + 1})` : '';
+        if (fromInput.validity.badInput || (from && tariffDate(from) !== from)) {
+          return {error: `The from date for “${name}”${which} isn’t complete. Fill it in${n ? '' : ' or clear it'}.`, input: fromInput};
+        }
+        if (!from && n) return {error: `Fill in the date rates ${n + 1} for “${name}” start from. Only the first rates can leave it blank.`, input: fromInput};
+        if (t.rates.some((p) => p.from === from)) {
+          return {error: `“${name}” has two sets of rates from ${niceDate(from)}. Give each set the date it starts.`, input: fromInput};
+        }
+        const p = {from};
+        for (const {col, label} of periodColumns()) {
+          const input = box.querySelector(`[data-col="${col}"]`);
+          const v = input.value.trim().replace(/^0+(?=\d)/, '');
+          if (v === '' && col === CREDIT_COLUMN.col) { p[col] = '0'; continue; }
+          if (v === '') return {error: `Fill in the ${label} for “${name}”${which}.`, input};
+          if (!isAmount(v)) return {error: `The ${label} for “${name}”${which} should be a number of cents, like 24.3431.`, input};
+          p[col] = v;
+        }
+        t.rates.push(p);
       }
+      t.rates.sort((a, b) => (a.from < b.from ? -1 : a.from > b.from ? 1 : 0));
       list.push(t);
     }
     if (!list.length) return {error: 'Add at least one tariff.', input: $('#tariff-add')};
     return {list};
   }
 
+  // A field that gets focus (by Tab, or when a problem points at it) shouldn't end up under the sticky footer.
+  const clearFoot = () => { dialog().style.scrollPaddingBottom = `${dialog().querySelector('.app-dialog-foot').offsetHeight + 8}px`; };
+
   function checkedTariffs() {
     const r = collectTariffs();
     if (r.error) {
-      if (r.input.tagName === 'INPUT') r.input.setAttribute('aria-invalid', 'true');
+      if (r.input.tagName === 'INPUT') {
+        r.input.setAttribute('aria-invalid', 'true');
+        r.input.setAttribute('aria-describedby', 'tariff-status');
+      }
       tariffStatus('error', r.error);
-      r.input.focus();
+      clearFoot();   // now, as the message may have made the footer taller
+      r.input.focus({preventScroll: true});
+      r.input.scrollIntoView({block: 'nearest'});
       return null;
     }
     return r.list;
@@ -691,36 +477,56 @@
   function wireTariffs() {
     $('#app-tariffs-btn').addEventListener('click', openTariffs);
     dialog().querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', () => dialog().close()));
+    if (window.ResizeObserver) new ResizeObserver(clearFoot).observe(dialog().querySelector('.app-dialog-foot'));
     $('#tariff-form').addEventListener('submit', (e) => {
       e.preventDefault();
       const list = checkedTariffs();
       if (!list) return;
-      setTariffs(tariffsToCsv(list), 'The tariff list', true);
+      try {
+        setTariffs(tariffsToCsv(list), 'The tariff list', true);
+      } catch (err) {
+        tariffStatus('error', err.message);
+        return;
+      }
       dialog().close();
       message('info', 'Tariffs saved.');
     });
     $('#tariff-add').addEventListener('click', () => {
-      const box = $('#tariff-list');
-      const card = tariffCard({tariff: '', current: false}, box.children.length);
-      box.append(card);
+      const card = tariffCard({tariff: '', current: false});
+      $('#tariff-list').append(card);
       syncTariffCards();
       card.querySelector('[name="tariff"]').focus();
     });
     $('#tariff-list').addEventListener('click', (e) => {
-      const b = e.target.closest('.app-remove');
+      const b = e.target.closest('button');
       if (!b) return;
       const card = b.closest('.app-tariff');
-      const next = card.nextElementSibling || card.previousElementSibling;
-      card.remove();
-      syncTariffCards();
-      if (next) next.querySelector('[name="tariff"]').focus();
+      if (b.matches('.app-remove')) {
+        const next = card.nextElementSibling || card.previousElementSibling;
+        card.remove();
+        syncTariffCards();
+        if (next) next.querySelector('[name="tariff"]').focus();
+      } else if (b.matches('.app-period-add')) {
+        // New rates start as a copy of the latest ones, so only what changed needs typing.
+        const boxes = card.querySelectorAll('.app-period');
+        const last = boxes[boxes.length - 1];
+        const copy = Object.fromEntries(periodColumns().map(({col}) => [col, last.querySelector(`[data-col="${col}"]`).value]));
+        const box = periodBox(copy);
+        last.after(box);
+        syncTariffCards();
+        box.querySelector('[data-col="from"]').focus();
+      } else if (b.matches('.app-period-remove')) {
+        const box = b.closest('.app-period');
+        const next = box.nextElementSibling || box.previousElementSibling;
+        box.remove();
+        syncTariffCards();
+        next.querySelector('[data-col="from"]').focus();
+      }
     });
     $('#tariff-list').addEventListener('input', (e) => {
       e.target.removeAttribute('aria-invalid');
-      if (e.target.name === 'tariff') {
-        const card = e.target.closest('.app-tariff');
-        card.querySelector('.app-remove').setAttribute('aria-label', `Remove ${e.target.value.trim() || 'this tariff'}`);
-      }
+      e.target.removeAttribute('aria-describedby');
+      if (e.target.name === 'tariff') syncTariffCards();
     });
     $('#tariff-import').addEventListener('click', () => $('#tariff-file').click());
     $('#tariff-file').addEventListener('change', async (e) => {
@@ -825,16 +631,38 @@
       status.textContent = window.isSecureContext ? '' : 'It isn’t served over https, so it can’t save itself for offline use.';
       return;
     }
-    const hadController = !!navigator.serviceWorker.controller;
+    // A new version installs alongside the one this page runs on and waits
+    // (sw.js doesn't skip waiting), so a page never mixes old and new files.
+    // Reload asks the waiting worker to take over, and every open tab then
+    // reloads once, on controllerchange.
+    let controlled = !!navigator.serviceWorker.controller;
+    let reloading = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      // The first visit's worker taking charge: this page already has its files.
+      if (!controlled) { controlled = true; return; }
+      if (reloading) return;
+      // Not twice within a few seconds either: a worker that keeps replacing
+      // itself (DevTools' "Update on reload" does) would reload for ever.
+      try {
+        if (Date.now() - Number(sessionStorage.getItem('synergy-tool-reloaded') || 0) < 10000) return;
+        sessionStorage.setItem('synergy-tool-reloaded', String(Date.now()));
+      } catch { /* storage blocked: `reloading` still stops a loop within this page */ }
+      reloading = true;
+      window.location.reload();
+    });
     navigator.serviceWorker.register('sw.js').then((reg) => {
+      const offer = () => {
+        if (!navigator.serviceWorker.controller) return;   // a first install takes over by itself
+        message('info', 'A new version of the app is ready.', {label: 'Reload', fn: () => {
+          if (reg.waiting) reg.waiting.postMessage({type: 'SKIP_WAITING'});
+          else window.location.reload();
+        }});
+      };
+      if (reg.waiting) offer();
       reg.addEventListener('updatefound', () => {
         const worker = reg.installing;
         if (!worker) return;
-        worker.addEventListener('statechange', () => {
-          if (worker.state === 'activated' && hadController) {
-            message('info', 'A new version of the app has been downloaded.', {label: 'Reload', fn: () => window.location.reload()});
-          }
-        });
+        worker.addEventListener('statechange', () => { if (worker.state === 'installed') offer(); });
       });
     }).catch((e) => {
       console.warn('Service worker:', e);
@@ -891,7 +719,7 @@
   /* ------------------------------------------------------------ start */
 
   async function start() {
-    if (!window.d3 || !window.dash || !dash.start || DEFAULT_TARIFFS == null) {
+    if (!window.d3 || !window.dash || !dash.start || DEFAULT_TARIFFS == null || !R.readTariffs) {
       $('#app-boot-error').hidden = false;
       return;
     }
@@ -906,7 +734,10 @@
     let useSaved = typeof savedTariffs === 'string';
     if (useSaved && typeof savedBase === 'string' && savedBase !== DEFAULT_TARIFFS) {
       // data/tariffs.csv has changed since this browser's tariff list was saved.
-      if (canon(savedTariffs) === canon(savedBase)) {
+      const base = canon(savedBase);
+      if (base !== null && base === canon(DEFAULT_TARIFFS)) {
+        store.set('tariffsBase', DEFAULT_TARIFFS);   // only its layout changed (say, a new column), not the tariffs
+      } else if (canon(savedTariffs) === base) {
         useSaved = false;   // the list was just the old defaults, so take the new ones
         store.del('tariffs');
         store.del('tariffsBase');

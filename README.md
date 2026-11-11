@@ -4,16 +4,28 @@ A web app that turns a smart meter's half-hourly interval CSV (such as
 `MA_IntervalDataHistory.csv`) into an interactive dashboard of use and cost.
 It shows:
 
-- cost on each tariff, with a side-by-side comparison
-- use per day and per half-hour
+- cost on each tariff, with a side-by-side comparison, each day priced at the
+  rates in force on that date (the tariff list holds Synergy's past rates
+  too), less any daily credit such as a concession
+- where each pair of tariffs breaks even: at what share of use at peak, or
+  what kWh a day, they would cost the same
+- your next bill: the billing period so far, plus an estimate of the rest
+- use per day and per half-hour, and by time of day (overnight, morning,
+  daytime, early evening, late evening)
+- where the cost concentrates: how much of it falls in the dearest half-hours
+- peak demand: each day's busiest half-hour, and when it tends to happen
 - a heat map, an average day, and month and weekday breakdowns
-- a savings calculator for moving peak use
+- a savings calculator for moving peak use, and a battery what-if with payback
+- the longer-term trend: a 30-day average across all the files opened, and
+  comparisons with the same dates a year earlier
 - unusual usage: days, spikes and stretches of raised always-on use that
   stand out from the weeks around them, what each cost, and checks on the
   data itself (gaps, zero runs, repeated readings, readings in the wrong
   rate period, repeated times, negative values)
 
-Every figure follows the tariff and dates you pick.
+Every figure follows the tariff and dates you pick. Long histories (several
+90-day exports opened together) stay quick: figures are only worked out for
+the dates on show, and charts only redraw when what they show changes.
 
 Everything happens in the browser:
 
@@ -38,12 +50,13 @@ synergy_usage_tool/
     manifest.webmanifest, icons/   lets it be installed like an app
     css/app.css        colours, type, and the parts around the dashboard
     css/dashboard.css  dashboard layout and chart styles
-    js/app.js          opening and checking files, tariff editor, saving, offline/install
+    js/readers.js      reads and checks the meter and tariff CSVs (shared with the tests, and mirrored in stamp_version.py)
+    js/app.js          opening files, tariff editor, saving, offline/install
     js/runtime.js      runs the dashboard's data steps and redraws on each choice
     js/dashboard.js    the dashboard: figures and charts
     js/default-tariffs.js, js/sample-data.js   made from data/ by stamp_version.py; don't edit
     vendor/            d3 v7.9.0 charting library and its ISC licence
-  tests/               tests of the dashboard's figures (see "Checks")
+  tests/               tests of the readers, the stamp script and the dashboard's figures (see "Checks")
   package.json, eslint.config.mjs, ruff.toml   settings for the checks; the app doesn't use them
   .github/workflows/   GitHub Actions: the checks, and publishing to GitHub Pages
 ```
@@ -78,28 +91,44 @@ or a shared web host.
 
 ### GitHub Pages
 
-`.github/workflows/pages.yml` publishes `public/` each time `main` changes,
-once the checks pass. It runs `stamp_version.py` itself before publishing, so
-a change goes live even if the script wasn't run first: for example, new rates
-typed into `public/data/tariffs.csv` with GitHub's web editor. A tariffs.csv
-the script rejects stops the publish, and the site stays as it was.
+`.github/workflows/pages.yml` publishes `public/` each time the `production`
+branch changes, and at no other time, once the checks pass. Work on `main` or
+any other branch is only checked. To publish, merge or push into
+`production`.
 
-Set it up once, on GitHub: **Settings → Pages → Build and deployment →
-Source: GitHub Actions**. The site is then at
-`https://<user>.github.io/<repository>/`. To publish again without a change,
-run "Publish to GitHub Pages" from the Actions tab.
+It runs `stamp_version.py` itself before publishing, so a change goes live
+even if the script wasn't run first: for example, new rates typed into
+`public/data/tariffs.csv` with GitHub's web editor. A tariffs.csv the script
+rejects stops the publish, and the site stays as it was.
+
+Set it up once, on GitHub:
+
+1. **Settings → Pages → Build and deployment → Source: GitHub Actions.**
+2. **Settings → Environments → github-pages → Deployment branches and
+   tags:** add `production`. At first GitHub only lets the default branch
+   deploy, so without this the publish fails with "not allowed to deploy to
+   github-pages due to environment protection rules".
+
+The site is then at `https://<user>.github.io/<repository>/`. To publish
+again without a change, re-run the last "Publish to GitHub Pages" run from
+the Actions tab.
 
 ## Changing the default tariffs
 
-The tariffs the app starts with are in `public/data/tariffs.csv`, one tariff
-per row; the layout is under "Tariffs CSV" below.
+The tariffs the app starts with are in `public/data/tariffs.csv`, one row
+for each set of rates a tariff has had; the layout is under "Tariffs CSV"
+below.
 
 1. **Edit the file.** Change rates, add rows for new tariffs, or remove
-   rows. Mark the tariff most people are on `current` = `yes`.
-2. **Run `python3 stamp_version.py`.** It checks the file, stopping with the
-   line number of any problem. It then copies the file into
-   `js/default-tariffs.js`, which is how the app reads it, and gives the app
-   a new version.
+   rows. When a tariff's prices change, keep its old row and add one with
+   the new rates and the date they start in `from`, so older readings are
+   still priced at the old rates. Mark the tariff most people are on
+   `current` = `yes`. If you use Excel, save it as "CSV UTF-8".
+2. **Run `python3 stamp_version.py`.** It checks the file the same way the
+   app does, and lists any problems with their line numbers. It then copies
+   the file into `js/default-tariffs.js`, which is how the app reads it, and
+   gives the app a new version. To check a tariffs CSV on its own, run
+   `python3 stamp_version.py --check-tariffs path/to/tariffs.csv`.
 3. **Upload `public/` again.**
 
 Visitors get the new defaults on their next online visit:
@@ -111,6 +140,38 @@ Visitors get the new defaults on their next online visit:
 
 The sample readings in `public/data/sample-interval-data.csv` work the same
 way: replace the file, keeping the interval CSV layout, then run the script.
+
+### Where the default rates come from
+
+The default list holds Synergy's published prices, GST included, from
+1 July 2019 (Home Plan) and 1 July 2022 (Midday Saver, when it opened), each
+from the 1 July it took effect. WA household prices change on 1 July, so add
+a row for each tariff then, from:
+
+- Synergy's price changes page,
+  https://www.synergy.net.au/Global/Synergy-Price-Changes-2025 (the page
+  name changes with the year), and its brochure,
+  https://www.synergy.net.au/-/media/Files/PDF-Library/Standard_Electricity_Prices_Charges_brochure.pdf.
+  Older years are on the Wayback Machine (web.archive.org).
+- For Home Plan (A1), the Energy Operators (Electricity Retail Corporation)
+  (Charges) By-laws, https://www.legislation.wa.gov.au/legislation/statutes.nsf/law_s38407_currencies.html.
+
+The two "with EAP concession" tariffs are the same plans with the Energy
+Assistance Payment, which Synergy credits to concession card holders each
+day: that year's amount divided by 365, in `credit_cents_per_day`
+(https://www.synergy.net.au/Your-home/Manage-account/Rebates-and-concessions).
+The list starts the EAP in July 2020 ($305.25 a year); earlier days use that
+first amount. Other credits don't fit a fixed daily amount and aren't in the
+list: the Dependent Child Rebate depends on the number of children (add it to
+`credit_cents_per_day` yourself), the air-conditioning rebate only applies in
+the north of the state, and one-off bill credits (such as $150 in October
+2025) aren't daily.
+
+Synergy plans whose hours don't fit the three rate periods (off-peak
+9 pm–9 am, super off-peak 9 am–3 pm, peak 3 pm–9 pm) aren't in the list
+either: the Smart Home Plan (7 am boundaries, different weekday and weekend
+hours), the EV Add On (an extra overnight period), the EV Home Plan, and the
+Community Energy and Community Battery plans (free allowances).
 
 ## Changing the app: offline copies and `sw.js`
 
@@ -128,17 +189,21 @@ browser script.
   ```
   python3 stamp_version.py
   ```
-  It sets `VERSION` in `sw.js` from the contents of every file. It also keeps
+  It sets `VERSION` in `sw.js` from the contents of every file, ignoring line
+  endings, so Windows and Linux copies get the same version. It also keeps
   `sw.js`'s list of files to save up to date, which matters if you add a file,
-  and copies the CSV files in `data/` into the scripts the app reads.
+  and checks the CSV files in `data/` and copies them into the scripts the app
+  reads.
 - **If you skip that step, returning visitors don't see your change.**
   Anyone who has opened the app before, you included, keeps getting the old
   version. If you can't run Python, change the `VERSION` line in
   `sw.js` to any new value by hand. A file you added must also be added to
   `FILES` there. Changes to the CSV files in `data/` do need the script.
 - **Visitors get the new version on their next online visit.** The app
-  downloads it in the background and shows "A new version of the app has
-  been downloaded" with a Reload button.
+  downloads it in the background and shows "A new version of the app is
+  ready" with a Reload button. Until then the page keeps using the old
+  version's files, so it never mixes old and new. Reload switches every open
+  tab to the new version; closing every tab of the app does too.
 - **Offline mode starts after one online visit over https.** It doesn't apply
   when `index.html` is opened straight from disk. That case always uses the
   files as they are on disk, so it needs no version change.
@@ -151,9 +216,11 @@ python3 stamp_version.py --check
 
 It exits with status 1 if `sw.js` needs stamping. The checks below run it.
 
-To get the newest copy on your own device while testing, either reload twice,
-or open the browser's developer tools and use Application → Service workers →
-Update, or "Clear site data".
+To get the newest copy on your own device while testing, use the app's Reload
+button when it appears. Reloading the page by itself isn't enough: the new
+version waits until it's asked for, or until every tab of the app is closed.
+In the browser's developer tools, Application → Service workers → Update
+then "skipWaiting" does the same, as does "Clear site data".
 
 ## Checks
 
@@ -165,11 +232,22 @@ GitHub Actions runs these on every pull request and on every push
   only a warning, since publishing stamps them anyway; run
   `python3 stamp_version.py` and commit to bring the repository copy up to date.
 - ESLint on the app's JavaScript, and Ruff on `stamp_version.py`.
-- The tests in `tests/`. They run the dashboard's data steps on the sample
-  readings in Node: every reading is counted once, bills add up, the cheapest
-  tariff ranks first, and the events added to the sample (the weekend away,
-  the car charging, the power cut and so on) are found. If you replace the
-  sample data, update the dates in `tests/dashboard.test.js`.
+- The tests in `tests/`, run in Node:
+  - `readers.test.js`: reading meter and tariff CSVs, and that
+    `stamp_version.py` accepts and rejects exactly the same files as the app,
+    with the same line numbers (so it needs `python3`). It also stamps temp
+    copies of `public/` to check line endings and odd file names.
+  - `dashboard.test.js`: the dashboard's figures on the sample readings: every
+    reading is counted once, bills add up, the cheapest tariff ranks first,
+    and the events added to the sample (the weekend away, the car charging,
+    the power cut and so on) are found.
+  - `features.test.js`: dated rates and credits, break-even, time of day, cost
+    concentration, peak demand, year-on-year figures, the battery and the
+    next-bill projection.
+
+  If you replace the sample data, update the dates in `tests/dashboard.test.js`
+  and `tests/features.test.js`; if you change the default tariffs, the last
+  test in `features.test.js` checks the 2025–26 rates.
 
 To run them yourself you need Node 20.19 or later and Python 3.8 or later:
 
@@ -303,14 +381,39 @@ zero runs, repeated readings and repeated times, are listed under
 
 This is the layout of `public/data/tariffs.csv`, and of the files Tariffs
 imports and exports. Visitors can also replace their own tariff list by
-dropping a tariffs CSV on the page, or by importing one under Tariffs. Rates are in cents. A flat-rate plan repeats one rate in all
-three rate columns.
+dropping a tariffs CSV on the page, or by importing one under Tariffs.
+
+| Column | Contents |
+| --- | --- |
+| `tariff` | the tariff's name |
+| `current` | `yes` for the tariff the dashboard opens on and compares the others with |
+| `from` | optional: the date this row's rates start, YYYY-MM-DD or D/M/YYYY (day first, as Excel saves dates in Australia); blank means from the start |
+| `supply_cents_per_day` | the daily supply charge |
+| `peak_cents_per_kwh`, `off_peak_cents_per_kwh`, `super_off_peak_cents_per_kwh` | the rate in each period; a flat-rate plan repeats one rate in all three |
+| `credit_cents_per_day` | optional: a daily credit, such as the Energy Assistance Payment; blank means none |
+
+- **Amounts** are in cents, written with the digits 0–9 and an optional
+  decimal point.
+- **Columns** can be in any order, and their names in any case.
+- **Rates that change.** A tariff can have several rows, one for each set of
+  rates. Each set lasts from its `from` date until the tariff's next one.
+  Only one row of a tariff can leave `from` blank, and no two can have the
+  same date. `current` = `yes` on any of its rows makes it current.
+- **Older files**, without `from` or `credit_cents_per_day`, still work: each
+  tariff has one set of rates and no credit.
+- **Exports** have every column, one row per set of rates, dates as
+  YYYY-MM-DD, and `current` on each of a tariff's rows.
 
 ```
-tariff,current,supply_cents_per_day,peak_cents_per_kwh,off_peak_cents_per_kwh,super_off_peak_cents_per_kwh
-Synergy Midday Saver,yes,132.7806,55.3253,24.3431,8.8520
-Home Plan,no,119.2419,33.2621,33.2621,33.2621
+tariff,current,from,supply_cents_per_day,peak_cents_per_kwh,off_peak_cents_per_kwh,super_off_peak_cents_per_kwh,credit_cents_per_day
+Synergy Midday Saver,yes,,132.7806,55.3253,24.3431,8.8520,0
+Home Plan,no,,119.2419,33.2621,33.2621,33.2621,0
+Example Plan,no,,110.5000,30.2000,30.2000,30.2000,0
+Example Plan,no,1/07/2025,115.0000,31.5000,31.5000,31.5000,150
 ```
+
+Here Example Plan's rates went up on 1 July 2025, and from then on it has a
+daily credit of $1.50.
 
 ## Browsers
 

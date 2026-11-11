@@ -2,9 +2,11 @@
  * load-app.js - runs the dashboard's data steps in Node, without a browser.
  *
  * It loads d3, runtime.js and dashboard.js into a sandbox with just enough of
- * a browser stubbed out for them to register their steps, then hands back
- * `dash`. Tests feed it CSV text with dash.setSources() and read results with
- * dash.data(id). Nothing is drawn: drawing needs a real page.
+ * a browser stubbed out for them to register their steps. loadApp() hands
+ * back `dash`; tests feed it CSV text with dash.setSources() and read results
+ * with dash.data(id). loadSandbox() hands back the whole sandbox, for the
+ * dashboard's top-level functions (simulateBattery, projectBill, ratesOn).
+ * Nothing is drawn: drawing needs a real page.
  */
 'use strict';
 const fs = require('node:fs');
@@ -14,7 +16,7 @@ const vm = require('node:vm');
 const PUBLIC = path.join(__dirname, '..', 'public');
 const read = (rel) => fs.readFileSync(path.join(PUBLIC, rel), 'utf8');
 
-function loadApp() {
+function loadSandbox() {
   const noop = () => {};
   const stored = new Map();
   const sandbox = {
@@ -35,10 +37,11 @@ function loadApp() {
   for (const file of ['vendor/d3.v7.9.0.min.js', 'js/runtime.js', 'js/dashboard.js']) {
     vm.runInContext(read(file), sandbox, {filename: file});
   }
-  return sandbox.dash;
+  return sandbox;
 }
 
+const loadApp = () => loadSandbox().dash;
 const sampleCsv = () => read('data/sample-interval-data.csv');
 const tariffsCsv = () => read('data/tariffs.csv');
 
-module.exports = {loadApp, sampleCsv, tariffsCsv, PUBLIC};
+module.exports = {loadApp, loadSandbox, sampleCsv, tariffsCsv, PUBLIC};

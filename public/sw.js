@@ -11,32 +11,34 @@
  * or run `python3 stamp_version.py` from the project folder, which sets it
  * from the files' contents and keeps FILES up to date too. Otherwise
  * visitors, and you, keep getting the old app. A visitor gets the new
- * version the next time they open the app online; it offers to reload.
+ * version the next time they open the app online: it downloads in the
+ * background and waits, and the page offers to reload into it.
  *
  * Offline use only works when the app is served over https (or from
  * http://localhost). Opening index.html straight from disk works without
  * a connection anyway, but doesn't use this file.
  */
-const VERSION = 'decb747c41ce';
+const VERSION = '0d61d5b0a289';
 const CACHE = `synergy-tool-${VERSION}`;
 // FILES-START (kept up to date by stamp_version.py)
 const FILES = [
-  './',
-  'css/app.css',
-  'css/dashboard.css',
-  'icons/apple-touch-icon.png',
-  'icons/icon-192.png',
-  'icons/icon-512.png',
-  'icons/icon-maskable-512.png',
-  'icons/icon.svg',
-  'js/app.js',
-  'js/dashboard.js',
-  'js/default-tariffs.js',
-  'js/runtime.js',
-  'js/sample-data.js',
-  'manifest.webmanifest',
-  'vendor/d3-LICENSE.txt',
-  'vendor/d3.v7.9.0.min.js',
+  "./",
+  "css/app.css",
+  "css/dashboard.css",
+  "icons/apple-touch-icon.png",
+  "icons/icon-192.png",
+  "icons/icon-512.png",
+  "icons/icon-maskable-512.png",
+  "icons/icon.svg",
+  "js/app.js",
+  "js/dashboard.js",
+  "js/default-tariffs.js",
+  "js/readers.js",
+  "js/runtime.js",
+  "js/sample-data.js",
+  "manifest.webmanifest",
+  "vendor/d3-LICENSE.txt",
+  "vendor/d3.v7.9.0.min.js",
 ];
 // FILES-END
 
@@ -57,8 +59,17 @@ async function saveFiles() {
   }));
 }
 
+// A new version waits until the page asks for it (app.js's Reload button
+// sends SKIP_WAITING), rather than taking over at once: activating deletes
+// the old copies, and a page still running the old app.js could then load
+// newer files, such as js/sample-data.js, that don't match it. The first
+// install, with no older version in use, takes over straight away anyway.
 self.addEventListener('install', (event) => {
-  event.waitUntil(saveFiles().then(() => self.skipWaiting()));
+  event.waitUntil(saveFiles());
+});
+
+self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'SKIP_WAITING') self.skipWaiting();
 });
 
 self.addEventListener('activate', (event) => {

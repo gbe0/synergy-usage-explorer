@@ -61,18 +61,22 @@ test('bills add up on every tariff', () => {
   const plans = rows('plans');
   const usage = rows('usage').find((r) => r.range === 'all');
   const bills = rows('bills').filter((r) => r.range === 'all');
+  const days = rows('dayTotals');
   assert.equal(bills.length, plans.length);
   for (const b of bills) {
-    const p = plans.find((x) => x.tariff === b.tariff);
-    near(b.total, b.energy + b.supply, 0.011, `${b.tariff} total`);
-    near(b.supply, p.supplyPerDay * b.days, 0.011, `${b.tariff} supply`);
+    const mine = days.filter((d) => d.tariff === b.tariff);
+    near(b.total, b.energy + b.supply - b.credit, 0.011, `${b.tariff} total`);
+    // Each day's supply charge and credit are the ones in force on that day.
+    near(b.supply, mine.reduce((s, d) => s + d.rates.supplyPerDay, 0), 0.011, `${b.tariff} supply`);
+    near(b.credit, mine.reduce((s, d) => s + d.rates.creditPerDay, 0), 0.011, `${b.tariff} credit`);
     near(b.kWh, usage.total, 0.5, `${b.tariff} kWh`);
   }
-  // A flat-rate plan's energy is just kWh times its one rate.
+  // A flat-rate plan's energy is just each day's kWh times that day's one rate.
   const flat = plans.find((p) => p.peakCents === p.offPeakCents && p.offPeakCents === p.superOffPeakCents);
   if (flat) {
     const b = bills.find((x) => x.tariff === flat.tariff);
-    near(b.energy, (b.kWh * flat.peakCents) / 100, 0.25, `${flat.tariff} energy`);
+    const want = days.filter((d) => d.tariff === flat.tariff).reduce((s, d) => s + (d.kWh * d.rates.peakCents) / 100, 0);
+    near(b.energy, want, 0.25, `${flat.tariff} energy`);
   }
 });
 
@@ -100,11 +104,13 @@ test('moving peak use saves the rate difference on the kWh moved', () => {
   const totals = rows('dayTotals');
   const shift = rows('shift').filter((r) => r.range === 'all');
   for (const p of plans) {
-    const peakKWh = totals.filter((d) => d.tariff === p.tariff).reduce((s, d) => s + d.peakKWh, 0);
+    // Every day's peak kWh, at that day's difference between peak and super off-peak.
+    const want = totals.filter((d) => d.tariff === p.tariff)
+      .reduce((s, d) => s + (d.peakKWh * (d.rates.peakCents - d.rates.superOffPeakCents)) / 100, 0);
     const none = shift.find((r) => r.tariff === p.tariff && r.target === 'Super off-peak' && r.pct === 0);
     const every = shift.find((r) => r.tariff === p.tariff && r.target === 'Super off-peak' && r.pct === 100);
     assert.equal(none.saving, 0);
-    near(every.saving, (peakKWh * (p.peakCents - p.superOffPeakCents)) / 100, 0.011, `${p.tariff} saving`);
+    near(every.saving, want, 0.011, `${p.tariff} saving`);
   }
 });
 
@@ -142,7 +148,8 @@ test('data checks find the meter dropout and the power cut', () => {
 
 test('a custom date range is added, kept inside the file, and the figures follow it', () => {
   const {dash, rows} = withSample();
-  dash.setParams({from: '2025-08-10', to: '2025-08-01'}); // given backwards on purpose
+  // As the date fields do: the dates, and the custom range chosen. Given backwards on purpose.
+  dash.setParams({from: '2025-08-10', to: '2025-08-01', range: 'custom'});
   let custom = rows('ranges').find((r) => r.range === 'custom');
   assert.deepEqual([custom.from, custom.to, custom.days], ['2025-08-01', '2025-08-10', 10]);
   assert.equal(rows('bills').find((r) => r.range === 'custom').days, 10);

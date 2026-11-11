@@ -1,3 +1,25 @@
-tariff,current,from,supply_cents_per_day,peak_cents_per_kwh,off_peak_cents_per_kwh,super_off_peak_cents_per_kwh
-Synergy Midday Saver,yes,,132.7806,55.3253,24.3431,8.8520
-Home Plan,no,,119.2419,33.2621,33.2621,33.2621
+tariff,current,from,supply_cents_per_day,peak_cents_per_kwh,off_peak_cents_per_kwh,super_off_peak_cents_per_kwh,credit_cents_per_day
+Synergy Midday Saver,yes,2022-07-01,120.0000,50.0000,22.0000,8.0000,0
+Synergy Midday Saver,yes,2023-07-01,123.0000,51.2500,22.5500,8.2000,0
+Synergy Midday Saver,yes,2024-07-01,126.0750,52.5313,23.1138,8.4050,0
+Synergy Midday Saver,yes,2025-07-01,129.2269,53.8446,23.6916,8.6151,0
+Synergy Midday Saver,yes,2026-07-01,132.7806,55.3253,24.3431,8.8520,0
+Home Plan,no,2019-07-01,103.3263,28.8229,28.8229,28.8229,0
+Home Plan,no,2021-07-01,105.1400,29.3273,29.3273,29.3273,0
+Home Plan,no,2022-07-01,107.7685,30.0605,30.0605,30.0605,0
+Home Plan,no,2023-07-01,110.4600,30.8120,30.8120,30.8120,0
+Home Plan,no,2024-07-01,113.2200,31.5823,31.5823,31.5823,0
+Home Plan,no,2025-07-01,116.0505,32.3719,32.3719,32.3719,0
+Home Plan,no,2026-07-01,119.2419,33.2621,33.2621,33.2621,0
+Synergy Midday Saver with EAP concession,no,2022-07-01,120.0000,50.0000,22.0000,8.0000,87.2247
+Synergy Midday Saver with EAP concession,no,2023-07-01,123.0000,51.2500,22.5500,8.2000,89.4027
+Synergy Midday Saver with EAP concession,no,2024-07-01,126.0750,52.5313,23.1138,8.4050,91.6411
+Synergy Midday Saver with EAP concession,no,2025-07-01,129.2269,53.8446,23.6916,8.6151,93.9315
+Synergy Midday Saver with EAP concession,no,2026-07-01,132.7806,55.3253,24.3431,8.8520,103.3260
+Home Plan with EAP concession,no,2020-07-01,103.3263,28.8229,28.8229,28.8229,83.6301
+Home Plan with EAP concession,no,2021-07-01,105.1400,29.3273,29.3273,29.3273,85.0959
+Home Plan with EAP concession,no,2022-07-01,107.7685,30.0605,30.0605,30.0605,87.2247
+Home Plan with EAP concession,no,2023-07-01,110.4600,30.8120,30.8120,30.8120,89.4027
+Home Plan with EAP concession,no,2024-07-01,113.2200,31.5823,31.5823,31.5823,91.6411
+Home Plan with EAP concession,no,2025-07-01,116.0505,32.3719,32.3719,32.3719,93.9315
+Home Plan with EAP concession,no,2026-07-01,119.2419,33.2621,33.2621,33.2621,103.3260

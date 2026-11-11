@@ -228,13 +228,21 @@ a { color: var(--app-accent); }
 .app-current { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; padding-bottom: 7px; cursor: pointer; }
 .app-current input { accent-color: var(--app-accent); width: 16px; height: 16px; margin: 0; }
 .app-remove { margin-left: auto; }
-.app-tariff-rates { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr)); gap: 10px; }
+/* Each set of rates: a line with its name on it, then the date and the daily amounts above the per-kWh rates. */
+.app-periods { display: grid; gap: 12px; }
+.app-period { margin: 0; min-width: 0; border: 0; border-top: 1px solid var(--color-border-line); padding: 6px 0 0; display: grid; gap: 8px; }
+.app-period legend { padding: 0 8px 0 0; font-size: 12px; font-weight: 600; color: var(--color-fg-muted); }
+.app-tariff-rates { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.app-field input[type="date"] { min-height: 32px; }
+.app-period-remove { justify-self: end; }
+.app-period-add { justify-self: start; }
 #tariff-add { justify-self: start; }
 .app-dialog-foot {
   display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px;
   position: sticky; bottom: 0; margin-bottom: -20px; padding: 14px 0 20px; background: var(--color-bg); border-top: 1px solid var(--color-border-line);
 }
 .app-dialog-tools, .app-dialog-main { display: flex; flex-wrap: wrap; gap: 8px; }
+#tariff-status { flex-basis: 100%; }
 .app-dialog-main { margin-left: auto; }
 
 @media (max-width: 520px) {
@@ -242,6 +250,9 @@ a { color: var(--app-accent); }
   .app-welcome h1 { font-size: 25px; }
   .app-dialog form { padding: 14px; }
   .app-dialog-foot { margin-bottom: -14px; padding-bottom: 14px; }
+  .app-tariff { padding-inline: 10px; }
+  .app-tariff-rates { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .app-field-from { grid-column: 1 / -1; }
 }
 @media print {
   .app-bar, .app-msgs, .app-data-tools, .app-foot { display: none; }

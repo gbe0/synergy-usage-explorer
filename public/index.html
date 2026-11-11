@@ -24,6 +24,7 @@
 <script defer src="js/runtime.js"></script>
 <script defer src="js/dashboard.js"></script>
 <script defer src="js/default-tariffs.js"></script>
+<script defer src="js/readers.js"></script>
 <script defer src="js/app.js"></script>
 </head>
 <body>
@@ -83,7 +84,7 @@
       <li><b>Billing Status</b> (optional): “Billed”, or anything else for readings not billed yet</li>
     </ul>
     <p>Several files, or files joined into one by hand, are merged: each half-hour is counted once, preferring a billed reading, then the file whose readings run latest. Missing half-hours are listed so you know where the gaps are.</p>
-    <p>You can also drop a tariffs CSV (columns tariff, current, supply_cents_per_day, peak_cents_per_kwh, off_peak_cents_per_kwh, super_off_peak_cents_per_kwh) to replace the tariff list.</p>
+    <p>You can also drop a tariffs CSV (columns tariff, current, supply_cents_per_day, peak_cents_per_kwh, off_peak_cents_per_kwh, super_off_peak_cents_per_kwh, and optionally from and credit_cents_per_day) to replace the tariff list.</p>
   </details>
 </main>
 
@@ -117,7 +118,7 @@
       <select class="dash-select" id="range-pick" data-draw="range-pick" data-source="ranges"></select>
     </div>
     <p class="eu-lede" id="takeaway">From <span class="dash-skeleton" data-draw="first-day">—</span> to <span class="dash-skeleton" data-draw="last-day">—</span> this meter recorded <b class="dash-skeleton" data-draw="total">—</b> kWh. On <b data-draw="tariff-name">—</b> that comes to <b class="dash-skeleton" data-draw="bill-total">—</b> including the daily supply charge, or <b data-draw="bill-day">—</b> a day. The peak period, 3 pm to 9 pm, used <b data-draw="peak-share">—</b> of the electricity and made up <b data-draw="peak-cost-share">—</b> of the cost.<span data-when="multi"> Of the tariffs compared, <b data-draw="cheapest-name">—</b> is the cheapest for this usage, by <b data-draw="cheapest-margin">—</b>.</span></p>
-    <p class="eu-caveat" id="caveat">Costs use the per-kWh rates and daily supply charges in the tariff list (see Compare tariffs; change them under Tariffs at the top). Anything else on a real bill, such as concessions, credits or fees, is not included.</p>
+    <p class="eu-caveat" id="caveat">Costs use the per-kWh rates, daily supply charges and any daily credits (such as a concession) in the tariff list, each day at the rates in force on that date (see Rates under Compare tariffs; change them under Tariffs at the top). Anything else on a real bill, such as one-off credits or fees, is not included. <span data-draw="rates-note"></span></p>
   </header>
 
   <section class="eu-tiles" id="summary" aria-label="Summary">
@@ -136,6 +137,11 @@
       <span class="eu-big dash-skeleton" data-draw="bill-unbilled">—</span>
       <span class="eu-sub"><span data-draw="unbilled">—</span> kWh over <span data-draw="unbilled-days">—</span> days from <span data-draw="unbilled-from">—</span>, with supply</span>
     </div>
+    <div class="eu-tile" id="tile-nextbill">
+      <span class="eu-label">Next bill, projected</span>
+      <span class="eu-big dash-skeleton" data-draw="nb-total">—</span>
+      <span class="eu-sub"><span data-draw="nb-period">—</span> <a href="#nextbill">How it’s worked out</a></span>
+    </div>
     <div class="eu-tile" id="tile-price">
       <span class="eu-label">Average price paid</span>
       <span class="eu-big"><span class="dash-skeleton" data-draw="bill-cents">—</span><span class="eu-unit">¢ per kWh</span></span>
@@ -146,6 +152,27 @@
       <span class="eu-big"><span class="dash-skeleton" data-draw="anom-count">—</span><span class="eu-unit" data-draw="anom-unit"></span></span>
       <span class="eu-sub"><span data-draw="anom-sub">—</span> <a href="#anomalies">See what stood out</a></span>
     </div>
+  </section>
+
+  <section class="eu-sec" id="nextbill">
+    <div class="eu-sec-head">
+      <h2 id="nextbill-heading">Your next bill</h2>
+      <p class="eu-note" data-draw="nb-lede">—</p>
+    </div>
+    <div class="eu-billbar">
+      <label for="nb-from">Billing period from</label>
+      <input type="date" class="eu-date" id="nb-from">
+      <label for="nb-to">to</label>
+      <input type="date" class="eu-date" id="nb-to">
+      <button type="button" class="eu-btn eu-more" id="nb-reset">Next unbilled period</button>
+    </div>
+    <dl class="eu-facts" data-draw="nb-facts"></dl>
+    <div class="eu-legend">
+      <span><i class="eu-ln"></i>Cost so far</span>
+      <span><i class="eu-ln eu-ln-dash"></i>Estimate for the rest</span>
+      <span><i class="eu-sw eu-sw-band"></i>Likely range</span>
+    </div>
+    <div class="eu-chart eu-chart-mid" data-draw="nb-chart"></div>
   </section>
 
   <section class="eu-sec" id="compare">
@@ -165,6 +192,7 @@
             <th scope="col" data-field="tariff">Tariff</th>
             <th scope="col" class="eu-num" data-field="supply">Supply</th>
             <th scope="col" class="eu-num" data-field="energy">Energy</th>
+            <th scope="col" class="eu-num" data-field="credit" data-when="credit" hidden>Credit</th>
             <th scope="col" class="eu-num" data-field="total">Total</th>
             <th scope="col" class="eu-num" data-field="per30">Per 30 days</th>
             <th scope="col" class="eu-num" data-field="avgCents">¢ per kWh</th>
@@ -175,19 +203,39 @@
         <tbody data-draw="compare-rows"></tbody>
       </table>
     </div>
+    <div class="eu-sub-sec" data-when="multi">
+      <h3 id="breakeven-heading">Break-even</h3>
+      <p class="eu-note" data-draw="be-lede">—</p>
+      <div class="eu-tablewrap">
+        <table class="eu-table" id="breakeven-table" aria-labelledby="breakeven-heading">
+          <thead>
+            <tr>
+              <th scope="col">Tariff</th>
+              <th scope="col" class="eu-num">Cost a day against the chosen tariff</th>
+              <th scope="col" class="eu-num">Same cost when peak use is</th>
+              <th scope="col" class="eu-num">Same cost when daily use is</th>
+            </tr>
+          </thead>
+          <tbody data-draw="be-rows"></tbody>
+        </table>
+      </div>
+    </div>
     <h3 id="compare-daily-heading">Cost per day on each tariff</h3>
     <div class="eu-legend" data-draw="compare-legend" data-source="plans"></div>
     <div class="eu-chart dash-skeleton" id="compare-lines" data-draw="compare-lines" data-source="daily plans"></div>
     <h3 id="rates-heading">Rates</h3>
+    <p class="eu-note">The rates in force during the chosen dates. Each starts on its date and lasts until the next.</p>
     <div class="eu-tablewrap">
-      <table class="eu-table" id="rate-table" data-source="tariffs" data-row-key="tariff">
+      <table class="eu-table" id="rate-table" data-source="plans" data-row-key="tariff,from">
         <thead>
           <tr>
             <th scope="col" data-field="tariff">Tariff</th>
+            <th scope="col" data-field="from">From</th>
             <th scope="col" class="eu-num" data-field="supply_cents_per_day">Supply, ¢ a day</th>
             <th scope="col" class="eu-num" data-field="peak_cents_per_kwh">Peak, ¢/kWh</th>
             <th scope="col" class="eu-num" data-field="off_peak_cents_per_kwh">Off-peak, ¢/kWh</th>
             <th scope="col" class="eu-num" data-field="super_off_peak_cents_per_kwh">Super off-peak, ¢/kWh</th>
+            <th scope="col" class="eu-num" data-field="credit_cents_per_day">Credit, ¢ a day</th>
           </tr>
         </thead>
         <tbody data-draw="rate-rows"></tbody>
@@ -247,6 +295,59 @@
     </div>
   </section>
 
+  <section class="eu-sec" id="battery">
+    <div class="eu-sec-head">
+      <h2 id="battery-heading">What a battery would save</h2>
+      <p class="eu-note" data-draw="bat-lede">—</p>
+    </div>
+    <div class="eu-shift">
+      <div class="eu-shift-controls">
+        <div class="eu-field">
+          <label for="bat-size">Usable size <b data-draw="bat-size-label">—</b></label>
+          <input class="eu-range" type="range" id="bat-size" min="1" max="30" step="1" value="10">
+        </div>
+        <div class="eu-fields">
+          <div class="eu-field">
+            <label for="bat-power">Power, kW</label>
+            <input class="eu-date eu-input" type="number" id="bat-power" min="0.5" max="30" step="0.5" value="5" inputmode="decimal">
+          </div>
+          <div class="eu-field">
+            <label for="bat-eff">Round-trip efficiency, %</label>
+            <input class="eu-date eu-input" type="number" id="bat-eff" min="50" max="100" step="1" value="90" inputmode="numeric">
+          </div>
+          <div class="eu-field">
+            <label for="bat-price">Installed price, $ (optional)</label>
+            <input class="eu-date eu-input" type="number" id="bat-price" min="0" step="100" placeholder="For payback" inputmode="numeric">
+          </div>
+        </div>
+      </div>
+      <div class="eu-tile" id="battery-result">
+        <span class="eu-label">Saving every year</span>
+        <span class="eu-big" data-draw="bat-year">—</span>
+        <span class="eu-sub" data-draw="bat-sub">—</span>
+      </div>
+    </div>
+    <div class="eu-legend">
+      <span><i class="eu-ln"></i>From the grid without a battery</span>
+      <span><i class="eu-ln eu-ln-dash"></i>With the battery, charging included</span>
+    </div>
+    <div class="eu-chart eu-chart-mid" data-draw="bat-chart"></div>
+    <div class="eu-tablewrap" data-when="multi">
+      <table class="eu-table" id="battery-table" aria-labelledby="battery-heading">
+        <thead>
+          <tr>
+            <th scope="col">Tariff</th>
+            <th scope="col" class="eu-num">Energy cost without</th>
+            <th scope="col" class="eu-num">With the battery</th>
+            <th scope="col" class="eu-num">Saving a year</th>
+            <th scope="col" class="eu-num">Payback</th>
+          </tr>
+        </thead>
+        <tbody data-draw="bat-rows"></tbody>
+      </table>
+    </div>
+  </section>
+
   <section class="eu-sec" id="daily">
     <div class="eu-sec-top">
       <h2 id="daily-heading">Use per day</h2>
@@ -264,6 +365,86 @@
       <span><i class="eu-ln"></i>7-day average</span>
     </div>
     <div class="eu-chart dash-skeleton" id="daily-chart" data-draw="daily-chart" data-source="daily"></div>
+  </section>
+
+  <section class="eu-sec eu-half" id="timeofday">
+    <div class="eu-sec-top">
+      <h2 id="timeofday-heading">Time of day</h2>
+      <div class="eu-toggle" role="group" aria-label="Show time of day as">
+        <button type="button" data-measure="cost" aria-pressed="true">Cost</button>
+        <button type="button" data-measure="kWh" aria-pressed="false">kWh</button>
+      </div>
+    </div>
+    <p class="eu-note" data-draw="tod-lede">—</p>
+    <div class="eu-chart eu-chart-short" data-draw="tod-chart"></div>
+    <div class="eu-tablewrap">
+      <table class="eu-table" id="tod-table" aria-labelledby="timeofday-heading">
+        <thead>
+          <tr>
+            <th scope="col">Part of the day</th>
+            <th scope="col">Hours</th>
+            <th scope="col" class="eu-num">kWh a day</th>
+            <th scope="col" class="eu-num">Share of kWh</th>
+            <th scope="col" class="eu-num">Energy cost a day</th>
+            <th scope="col" class="eu-num">Share of cost</th>
+            <th scope="col" class="eu-num">Average kW</th>
+          </tr>
+        </thead>
+        <tbody data-draw="tod-rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="eu-sec eu-half" id="concentration">
+    <div class="eu-sec-head">
+      <h2 id="concentration-heading">Where the cost concentrates</h2>
+      <p class="eu-note" data-draw="conc-lede">—</p>
+    </div>
+    <div class="eu-legend">
+      <span><i class="eu-ln"></i>Share of the energy cost</span>
+      <span><i class="eu-ln eu-ln-dash"></i>If every half-hour cost the same</span>
+    </div>
+    <div class="eu-chart eu-chart-mid" data-draw="conc-chart"></div>
+    <div class="eu-tablewrap">
+      <table class="eu-table" id="conc-table" aria-labelledby="concentration-heading">
+        <thead>
+          <tr>
+            <th scope="col">Dearest half-hours</th>
+            <th scope="col" class="eu-num">Hours</th>
+            <th scope="col" class="eu-num">Share of energy cost</th>
+            <th scope="col" class="eu-num">Share of kWh</th>
+            <th scope="col" class="eu-num">Energy cost</th>
+          </tr>
+        </thead>
+        <tbody data-draw="conc-rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="eu-sec" id="demand">
+    <div class="eu-sec-head">
+      <h2 id="demand-heading">Peak demand</h2>
+      <p class="eu-note" data-draw="dem-lede">—</p>
+    </div>
+    <div class="eu-anom-charts">
+      <div class="eu-anom-chart">
+        <h3>The busiest half-hour of each day</h3>
+        <div class="eu-legend">
+          <span><i class="eu-sw eu-sw-off"></i>Off-peak</span>
+          <span><i class="eu-sw eu-sw-super"></i>Super off-peak</span>
+          <span><i class="eu-sw eu-sw-peak"></i>Peak</span>
+          <span><i class="eu-ln eu-ln-dash"></i>Typical day</span>
+        </div>
+        <div class="eu-chart eu-chart-mid" data-draw="dem-chart"></div>
+      </div>
+      <div class="eu-anom-chart">
+        <h3>When each day’s busiest half-hour starts</h3>
+        <div class="eu-legend">
+          <span>Number of days, by hour</span>
+        </div>
+        <div class="eu-chart eu-chart-mid" data-draw="dem-hours"></div>
+      </div>
+    </div>
   </section>
 
   <section class="eu-sec" id="anomalies">
@@ -386,6 +567,23 @@
     <div class="eu-chart eu-chart-mid dash-skeleton" id="weekday-chart" data-draw="weekday-chart" data-source="weekdays"></div>
   </section>
 
+  <section class="eu-sec" id="trend">
+    <div class="eu-sec-top">
+      <h2 id="trend-heading">Longer-term trend</h2>
+      <div class="eu-toggle" role="group" aria-label="Show trend as">
+        <button type="button" data-measure="cost" aria-pressed="true">Cost</button>
+        <button type="button" data-measure="kWh" aria-pressed="false">kWh</button>
+      </div>
+    </div>
+    <p class="eu-note" data-draw="trend-lede">—</p>
+    <div class="eu-legend">
+      <span><i class="eu-ln"></i>30-day average</span>
+      <span><i class="eu-ln eu-ln-dash"></i>A year earlier</span>
+      <span><i class="eu-sw eu-sw-band"></i>Chosen dates</span>
+    </div>
+    <div class="eu-chart" data-draw="trend-chart"></div>
+  </section>
+
   <section class="eu-sec" id="months">
     <div class="eu-sec-head">
       <h2 id="months-heading">Month by month</h2>
@@ -403,6 +601,8 @@
             <th scope="col" class="eu-num" data-field="supply">Supply</th>
             <th scope="col" class="eu-num" data-field="cost">Total</th>
             <th scope="col" class="eu-num" data-field="costPerDay">Total a day</th>
+            <th scope="col" class="eu-num" data-field="kWhPerDayLastYear">kWh a day, a year earlier</th>
+            <th scope="col" class="eu-num" data-field="kWhChange">Change</th>
           </tr>
         </thead>
         <tbody data-draw="month-rows"></tbody>
@@ -415,10 +615,17 @@
     <ul>
       <li>The readings come from <span data-app="file-name">the file you opened</span>: one kWh reading per half-hour, labelled with the time the half-hour starts.</li>
       <li>Each reading sits in one of three columns, which sets its rate period: off-peak 9 pm–9 am, super off-peak 9 am–3 pm, peak 3 pm–9 pm. The hours are the same every day, weekends included.</li>
-      <li>Tariff rates and supply charges come from the tariff list (Tariffs, at the top of the page), in cents. The tariff marked current there is the one the page opens on and compares against.</li>
-      <li>A half-hour’s energy cost is its kWh times its period’s rate. Each day also adds that tariff’s supply charge.</li>
+      <li>Tariff rates, supply charges and daily credits come from the tariff list (Tariffs, at the top of the page), in cents. The tariff marked current there is the one the page opens on and compares against.</li>
+      <li>A tariff can list several sets of rates, each from a date. Every day is priced at the set in force on that date. Days before a tariff’s first set (for example, before the plan existed) use that first set, and the note at the top says so.</li>
+      <li>A half-hour’s energy cost is its kWh times its period’s rate. Each day also adds that tariff’s supply charge and takes off any daily credit, such as a concession.</li>
       <li>Every tariff is priced on the same half-hourly use. On a different tariff you might use electricity at different times.</li>
       <li>The savings estimate moves the chosen share of every day’s peak kWh to the chosen period and prices it at that period’s rate. Total kWh stays the same.</li>
+      <li>Your next bill adds up the days in the billing period that have readings, at what they cost, and estimates the rest from the average day over the 28 days of readings up to the end of the period, priced at each day’s rates. The likely range uses the quieter and busier days among those 28 (the 10th and 90th percentile).</li>
+      <li>Break-even keeps your total kWh, and the split of the rest between off-peak and super off-peak, as they were, and asks at what share of use at peak, or at what kWh a day, two tariffs would cost the same, at the rates in force on the last chosen day.</li>
+      <li>The battery charges from the grid in the tariff’s cheapest period, up to its size and power, and powers the home whenever the rate is high enough to beat what the charge cost after losses, until it is empty. It never sends power to the grid, and without solar readings it can’t count charging from solar panels. On a flat-rate tariff it saves nothing. The yearly saving scales the chosen dates up to 365 days, so seasons matter.</li>
+      <li>Peak demand is the average power in a day’s busiest half-hour (its kWh times 2). Shorter bursts, such as a kettle, are hidden inside the half-hour average.</li>
+      <li>Where the cost concentrates sorts every half-hour in the chosen dates by its energy cost and adds them up from the dearest.</li>
+      <li>The longer-term trend is a 30-day rolling average across the whole file, with the same days a year earlier where the file has them. Comparisons with a year earlier need readings for at least 80% as many days then.</li>
       <li>The dates chosen at the top apply to every figure and chart. “Cost per day” compares the last 7 days up to the end of the chosen dates with the 7 days before them.</li>
       <li>Unusual usage compares each day with up to 14 days either side of it. A day stands out when it used more than 9 in 10 of those days and at least 25% more than their middle value, or less than 9 in 10 of them and at least 25% less.</li>
       <li>A spike is a half-hour that used at least 0.75 kWh more, and half as much again, as that time of day reaches on 9 in 10 of those days, so things that happen most days don’t count. Its difference is measured against the middle value for that time.</li>
@@ -445,11 +652,13 @@
       <h2 id="tariff-title">Tariffs</h2>
       <button type="button" class="app-msg-close" data-close aria-label="Close">×</button>
     </div>
-    <p class="app-hint">Prices in cents, as on your bill. Peak is 3 pm–9 pm, off-peak 9 pm–9 am and super off-peak 9 am–3 pm, the same periods as the meter file. For a flat-rate plan, enter its one rate in all three. The current tariff is the one the dashboard opens on and compares the others with.</p>
+    <p class="app-hint">Prices in cents, as on your bill. Peak is 3 pm–9 pm, off-peak 9 pm–9 am and super off-peak 9 am–3 pm, the same periods as the meter file. For a flat-rate plan, enter its one rate in all three. A daily credit, such as the Energy Assistance Payment, comes off each day’s cost; leave it blank if you don’t get one. The current tariff is the one the dashboard opens on and compares the others with.</p>
+    <p class="app-hint">When prices change, use <b>Add new rates</b> and enter the date they start. Each set of rates lasts until the next one starts. Leave the first set’s date blank if it applies from the start of your readings.</p>
     <div class="app-tariffs" id="tariff-list"></div>
     <button type="button" class="app-btn" id="tariff-add">Add a tariff</button>
-    <p id="tariff-status" hidden></p>
     <div class="app-dialog-foot">
+      <!-- In the sticky footer, so a problem shows wherever the list is scrolled to. -->
+      <p id="tariff-status" hidden></p>
       <div class="app-dialog-tools">
         <button type="button" class="app-btn app-btn-quiet" id="tariff-import">Import CSV…</button>
         <button type="button" class="app-btn app-btn-quiet" id="tariff-export">Export CSV</button>
@@ -482,12 +691,24 @@
       <label class="app-current"><input type="radio" name="current"> Current tariff</label>
       <button type="button" class="app-btn app-btn-quiet app-remove">Remove</button>
     </div>
+    <div class="app-periods"></div>
+    <button type="button" class="app-btn app-btn-quiet app-period-add">Add new rates</button>
+  </fieldset>
+</template>
+
+<!-- One set of rates in a tariff card. app.js fills in the legend and the From label. -->
+<template id="tariff-period">
+  <fieldset class="app-period">
+    <legend>Rates</legend>
     <div class="app-tariff-rates">
+      <label class="app-field app-field-from"><span>From</span><input data-col="from" type="date" min="1900-01-01" max="2999-12-31"></label>
       <label class="app-field"><span>Supply, ¢ a day</span><input data-col="supply_cents_per_day" type="text" inputmode="decimal" autocomplete="off"></label>
+      <label class="app-field"><span>Credit, ¢ a day</span><input data-col="credit_cents_per_day" type="text" inputmode="decimal" autocomplete="off"></label>
       <label class="app-field"><span>Peak, ¢/kWh</span><input data-col="peak_cents_per_kwh" type="text" inputmode="decimal" autocomplete="off"></label>
       <label class="app-field"><span>Off-peak, ¢/kWh</span><input data-col="off_peak_cents_per_kwh" type="text" inputmode="decimal" autocomplete="off"></label>
       <label class="app-field"><span>Super off-peak, ¢/kWh</span><input data-col="super_off_peak_cents_per_kwh" type="text" inputmode="decimal" autocomplete="off"></label>
     </div>
+    <button type="button" class="app-link app-period-remove">Remove these rates</button>
   </fieldset>
 </template>
 </body>
