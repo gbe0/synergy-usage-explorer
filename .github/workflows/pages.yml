@@ -1,0 +1,49 @@
+# Publishes public/ to GitHub Pages on every push to main, once the checks
+# pass. It runs stamp_version.py itself, so edits made on GitHub go live too.
+#
+# One-time setup on GitHub: Settings → Pages → Build and deployment →
+# Source: "GitHub Actions".
+name: Publish to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deployment at a time. A newer push waits for the one in progress
+# instead of cancelling it halfway.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Deploy
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+      # Sets sw.js's VERSION and file list and rebuilds js/default-tariffs.js
+      # and js/sample-data.js from data/, so a change goes live (and reaches
+      # returning visitors) even if nobody ran the script before pushing.
+      - name: Stamp sw.js and the generated js files
+        run: python3 stamp_version.py
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: public
+      - id: deployment
+        uses: actions/deploy-pages@v5

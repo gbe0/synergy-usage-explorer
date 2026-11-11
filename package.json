@@ -1,0 +1,18 @@
+{
+  "name": "synergy-usage-explorer",
+  "private": true,
+  "description": "Development checks for Synergy Usage Explorer. The app itself (public/) needs no install or build step; this is only for linting and tests.",
+  "scripts": {
+    "lint": "eslint .",
+    "test": "node --test",
+    "check": "python3 stamp_version.py --check && eslint . && node --test"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.14.0",
+    "globals": "^17.14.0"
+  },
+  "engines": {
+    "node": "^20.19.0 || ^22.13.0 || >=24"
+  }
+}

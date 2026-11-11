@@ -1,0 +1,3 @@
+tariff,current,from,supply_cents_per_day,peak_cents_per_kwh,off_peak_cents_per_kwh,super_off_peak_cents_per_kwh
+Synergy Midday Saver,yes,,132.7806,55.3253,24.3431,8.8520
+Home Plan,no,,119.2419,33.2621,33.2621,33.2621

@@ -1,0 +1,5 @@
+# Keep LF line endings in every checkout, Windows included. stamp_version.py
+# hashes the files' bytes for sw.js's VERSION, so CRLF copies would make
+# `stamp_version.py --check` fail in CI.
+* text=auto eol=lf
+*.png binary

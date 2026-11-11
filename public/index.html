@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- The page never talks to a server: connect-src 'none' blocks fetch, XHR,
+     WebSockets and beacons, so files you open can't be sent anywhere. -->
+<meta http-equiv="Content-Security-Policy" content="connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Synergy Usage Explorer</title>
+<meta name="description" content="See half-hourly electricity use and what it costs on each tariff. Runs in the browser and works offline; nothing is uploaded.">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#14161b" media="(prefers-color-scheme: dark)">
+<script>
+  // Apply a theme chosen with the theme button before anything is drawn.
+  try { const t = localStorage.getItem('synergy-tool-theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) { /* storage blocked */ }
+</script>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="icon" href="icons/icon-192.png" type="image/png" sizes="192x192">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="css/app.css">
+<link rel="stylesheet" href="css/dashboard.css">
+<script defer src="vendor/d3.v7.9.0.min.js"></script>
+<script defer src="js/runtime.js"></script>
+<script defer src="js/dashboard.js"></script>
+<script defer src="js/default-tariffs.js"></script>
+<script defer src="js/app.js"></script>
+</head>
+<body>
+<header class="app-bar">
+  <div class="app-bar-in">
+    <span class="app-brand"><img src="icons/icon.svg" alt="" width="24" height="24">Synergy Usage Explorer</span>
+    <div class="app-actions">
+      <button type="button" class="app-btn app-theme" id="app-theme" aria-label="Switch to dark theme" title="Switch to dark theme">
+        <svg class="app-moon" width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+        <svg class="app-sun" width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3M4.6 4.6l2.1 2.1M17.3 17.3l2.1 2.1M4.6 19.4l2.1-2.1M17.3 6.7l2.1-2.1" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+      <button type="button" class="app-btn" id="app-install" hidden>Install app</button>
+      <button type="button" class="app-btn" id="app-tariffs-btn">Tariffs</button>
+      <button type="button" class="app-btn app-btn-primary" data-open>Open CSV…</button>
+    </div>
+  </div>
+  <input type="file" id="app-file" accept=".csv,text/csv" multiple hidden>
+</header>
+
+<div class="app-msgs" id="app-msg" aria-live="polite"></div>
+
+<noscript><p class="app-boot-error">This app needs JavaScript. Everything it does happens in your browser; nothing is uploaded.</p></noscript>
+<p class="app-boot-error" id="app-boot-error" hidden>Part of the app didn’t load. If you copied it somewhere, check that the js, css and vendor folders came too.</p>
+
+<main class="app-welcome" id="app-welcome" hidden>
+  <h1>See what your electricity costs, half-hour by half-hour</h1>
+  <p class="app-lede">Open the half-hourly interval data from your Synergy account, for example <i>MA_IntervalDataHistory.csv</i>. The dashboard prices every half-hour on each of your tariffs and shows when you use the most.</p>
+  <section class="app-steps" id="synergy-steps" aria-labelledby="steps-title">
+    <h2 id="steps-title">Download your usage data from Synergy</h2>
+    <ol>
+      <li>Log in to your Synergy account at <a href="https://my.synergy.net.au/" target="_blank" rel="noopener noreferrer">my.synergy.net.au</a>.</li>
+      <li>Select the <b>Usage</b> tab at the top of the page.</li>
+      <li>Check that you’re on the <b>Interval Data</b> page. Below the usage graph, select <b>Export</b>.</li>
+      <li>Set <b>Export as</b> to <b>CSV</b>, choose <b>half-hourly</b> data intervals and the dates you want, then export. The file is saved to your computer, usually in your Downloads folder.</li>
+      <li data-step="open">Open the CSV here: drop it on this page, or use <b>Choose files…</b> below.</li>
+    </ol>
+    <p class="app-hint">Synergy exports up to 90 days at a time. For a longer period, export each 90 days and open all the files together; where they overlap, each half-hour is only counted once. Later, add newer exports with <b>Add CSV files…</b> above the dashboard.</p>
+  </section>
+  <div class="app-drop-zone">
+    <svg width="40" height="40" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z M14 3v5h5 M12 18v-6 M9 15l3-3 3 3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <p><b>Drop the CSV files here</b><br>or</p>
+    <button type="button" class="app-btn app-btn-primary app-btn-big" data-open>Choose files…</button>
+  </div>
+  <p class="app-sample">No file yet? <button type="button" class="app-link" id="app-sample">Try it with sample data</button>, 90 days of readings in the same layout as a Synergy export, or <button type="button" class="app-link" id="app-sample-download">download the sample CSV</button>.</p>
+  <ul class="app-points">
+    <li><b>Private.</b> The file is read on this device and never uploaded. A copy stays in this browser so it’s here next time; “Forget this data” removes it.</li>
+    <li><b>Works offline.</b> After one visit online the app keeps working with no internet connection, and you can install it like an app.</li>
+    <li><b>Your tariffs.</b> It starts with the <span data-app="default-tariffs">default</span> rates. Change them, or add others to compare, under Tariffs.</li>
+  </ul>
+  <details class="app-format">
+    <summary>What the file needs to look like</summary>
+    <p>A CSV with one row per half-hour and these columns (the order doesn’t matter):</p>
+    <ul>
+      <li><b>Date</b>: DD/MM/YYYY, MM/DD/YYYY or YYYY-MM-DD</li>
+      <li><b>Time</b>: when the half-hour starts, like 13:30</li>
+      <li><b>PEAK (KWH)</b>, <b>OFF PEAK (KWH)</b>, <b>SUPER OFF PEAK (KWH)</b>: the reading goes in whichever column applies</li>
+      <li><b>Billing Status</b> (optional): “Billed”, or anything else for readings not billed yet</li>
+    </ul>
+    <p>Several files, or files joined into one by hand, are merged: each half-hour is counted once, preferring a billed reading, then the file whose readings run latest. Missing half-hours are listed so you know where the gaps are.</p>
+    <p>You can also drop a tariffs CSV (columns tariff, current, supply_cents_per_day, peak_cents_per_kwh, off_peak_cents_per_kwh, super_off_peak_cents_per_kwh) to replace the tariff list.</p>
+  </details>
+</main>
+
+<main id="dash-root" hidden>
+<section class="app-data" aria-label="Data file">
+  <p class="app-data-line"><b id="app-file-name"></b> <span id="app-file-meta"></span></p>
+  <div class="app-data-tools">
+    <label id="app-order-wrap" hidden>Dates are
+      <select class="dash-select" id="app-order">
+        <option value="dmy">day/month/year</option>
+        <option value="mdy">month/day/year</option>
+      </select>
+    </label>
+    <button type="button" class="app-link" id="app-help">How to download from Synergy</button>
+    <button type="button" class="app-link" id="app-add">Add CSV files…</button>
+    <button type="button" class="app-link" id="app-forget">Forget this data</button>
+  </div>
+  <details class="app-files" id="app-files" hidden>
+    <summary id="app-files-summary">Show the files</summary>
+    <ul id="app-files-list"></ul>
+  </details>
+  <ul class="app-notes" id="app-notes" hidden></ul>
+</section>
+<div class="eu">
+  <header class="eu-head" id="overview">
+    <h1 class="eu-title">Half-hourly electricity use</h1>
+    <div class="eu-tariffbar">
+      <label for="tariff-pick">Costs on</label>
+      <select class="dash-select" id="tariff-pick" data-draw="tariff-pick" data-source="plans"></select>
+      <label for="range-pick">for</label>
+      <select class="dash-select" id="range-pick" data-draw="range-pick" data-source="ranges"></select>
+    </div>
+    <p class="eu-lede" id="takeaway">From <span class="dash-skeleton" data-draw="first-day">—</span> to <span class="dash-skeleton" data-draw="last-day">—</span> this meter recorded <b class="dash-skeleton" data-draw="total">—</b> kWh. On <b data-draw="tariff-name">—</b> that comes to <b class="dash-skeleton" data-draw="bill-total">—</b> including the daily supply charge, or <b data-draw="bill-day">—</b> a day. The peak period, 3 pm to 9 pm, used <b data-draw="peak-share">—</b> of the electricity and made up <b data-draw="peak-cost-share">—</b> of the cost.<span data-when="multi"> Of the tariffs compared, <b data-draw="cheapest-name">—</b> is the cheapest for this usage, by <b data-draw="cheapest-margin">—</b>.</span></p>
+    <p class="eu-caveat" id="caveat">Costs use the per-kWh rates and daily supply charges in the tariff list (see Compare tariffs; change them under Tariffs at the top). Anything else on a real bill, such as concessions, credits or fees, is not included.</p>
+  </header>
+
+  <section class="eu-tiles" id="summary" aria-label="Summary">
+    <div class="eu-tile" id="tile-cost">
+      <span class="eu-label">Bill estimate, <span data-draw="first-day">—</span> – <span data-draw="last-day">—</span></span>
+      <span class="eu-big dash-skeleton" data-draw="bill-total">—</span>
+      <span class="eu-sub"><span data-draw="bill-energy">—</span> energy and <span data-draw="bill-supply">—</span> supply over <span data-draw="days">—</span> days</span>
+    </div>
+    <div class="eu-tile" id="tile-recent">
+      <span class="eu-label">Cost per day, <span data-draw="last7-range">—</span></span>
+      <span class="eu-big dash-skeleton" data-draw="bill-last7">—</span>
+      <span class="eu-sub"><span class="eu-chg" data-draw="chg7">—</span> vs <span data-draw="prev7-range">—</span>, <span data-draw="last7">—</span> kWh a day</span>
+    </div>
+    <div class="eu-tile" id="tile-unbilled">
+      <span class="eu-label">Not yet billed</span>
+      <span class="eu-big dash-skeleton" data-draw="bill-unbilled">—</span>
+      <span class="eu-sub"><span data-draw="unbilled">—</span> kWh over <span data-draw="unbilled-days">—</span> days from <span data-draw="unbilled-from">—</span>, with supply</span>
+    </div>
+    <div class="eu-tile" id="tile-price">
+      <span class="eu-label">Average price paid</span>
+      <span class="eu-big"><span class="dash-skeleton" data-draw="bill-cents">—</span><span class="eu-unit">¢ per kWh</span></span>
+      <span class="eu-sub">Including the daily supply charge</span>
+    </div>
+    <div class="eu-tile" id="tile-unusual">
+      <span class="eu-label">Unusual usage</span>
+      <span class="eu-big"><span class="dash-skeleton" data-draw="anom-count">—</span><span class="eu-unit" data-draw="anom-unit"></span></span>
+      <span class="eu-sub"><span data-draw="anom-sub">—</span> <a href="#anomalies">See what stood out</a></span>
+    </div>
+  </section>
+
+  <section class="eu-sec" id="compare">
+    <div class="eu-sec-head">
+      <h2 id="compare-heading">Compare tariffs</h2>
+      <p class="eu-note">What the same half-hourly use over the chosen dates would have cost on each tariff, supply charge included.</p>
+    </div>
+    <div class="eu-legend" id="compare-bars-legend">
+      <span><i class="eu-sw eu-sw-supply"></i>Supply charge</span>
+      <span>Coloured part: energy</span>
+    </div>
+    <div class="eu-chart eu-chart-short dash-skeleton" id="compare-bars" data-draw="compare-bars" data-source="bills plans"></div>
+    <div class="eu-tablewrap">
+      <table class="eu-table" id="compare-table" data-source="bills" data-row-key="range,tariff">
+        <thead>
+          <tr>
+            <th scope="col" data-field="tariff">Tariff</th>
+            <th scope="col" class="eu-num" data-field="supply">Supply</th>
+            <th scope="col" class="eu-num" data-field="energy">Energy</th>
+            <th scope="col" class="eu-num" data-field="total">Total</th>
+            <th scope="col" class="eu-num" data-field="per30">Per 30 days</th>
+            <th scope="col" class="eu-num" data-field="avgCents">¢ per kWh</th>
+            <th scope="col" class="eu-num" data-field="vsCurrent">Difference from current</th>
+            <th scope="col" class="eu-num" data-field="cheaperDays">Days cheaper than current</th>
+          </tr>
+        </thead>
+        <tbody data-draw="compare-rows"></tbody>
+      </table>
+    </div>
+    <h3 id="compare-daily-heading">Cost per day on each tariff</h3>
+    <div class="eu-legend" data-draw="compare-legend" data-source="plans"></div>
+    <div class="eu-chart dash-skeleton" id="compare-lines" data-draw="compare-lines" data-source="daily plans"></div>
+    <h3 id="rates-heading">Rates</h3>
+    <div class="eu-tablewrap">
+      <table class="eu-table" id="rate-table" data-source="tariffs" data-row-key="tariff">
+        <thead>
+          <tr>
+            <th scope="col" data-field="tariff">Tariff</th>
+            <th scope="col" class="eu-num" data-field="supply_cents_per_day">Supply, ¢ a day</th>
+            <th scope="col" class="eu-num" data-field="peak_cents_per_kwh">Peak, ¢/kWh</th>
+            <th scope="col" class="eu-num" data-field="off_peak_cents_per_kwh">Off-peak, ¢/kWh</th>
+            <th scope="col" class="eu-num" data-field="super_off_peak_cents_per_kwh">Super off-peak, ¢/kWh</th>
+          </tr>
+        </thead>
+        <tbody data-draw="rate-rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="eu-sec eu-half" id="periods">
+    <div class="eu-sec-head">
+      <h2 id="periods-heading">Where the money goes</h2>
+      <p class="eu-note">Each part of the bill on <b data-draw="tariff-name">—</b>: its share of the electricity used and of the cost.</p>
+    </div>
+    <div class="eu-chart eu-chart-short dash-skeleton" id="period-bars" data-draw="period-bars" data-source="periods"></div>
+    <div class="eu-tablewrap">
+      <table class="eu-table" id="period-table" data-source="periods" data-row-key="range,tariff,part">
+        <thead>
+          <tr>
+            <th scope="col" data-field="part">Part</th>
+            <th scope="col" data-field="hours">Hours</th>
+            <th scope="col" class="eu-num" data-field="rate">Rate, ¢</th>
+            <th scope="col" class="eu-num" data-field="kWh">kWh</th>
+            <th scope="col" class="eu-num" data-field="kWhShare">Share of kWh</th>
+            <th scope="col" class="eu-num" data-field="cost">Cost</th>
+            <th scope="col" class="eu-num" data-field="costShare">Share of cost</th>
+          </tr>
+        </thead>
+        <tbody data-draw="period-rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="eu-sec eu-half" id="shift">
+    <div class="eu-sec-head">
+      <h2 id="shift-heading">What moving peak use would save</h2>
+      <p class="eu-note" data-when="tou">Running things like the dryer, dishwasher or car charger outside 3 pm–9 pm buys the same kWh at a lower rate on <b data-draw="tariff-name">—</b>. Choose how much peak use to move, and where to.</p>
+      <p class="eu-note" data-when="flat" hidden><b data-draw="tariff-name">—</b> charges the same rate at every hour, so moving use to other times saves nothing on it. Pick a time-of-use tariff at the top to see what moving use would save.</p>
+    </div>
+    <div class="eu-shift" data-when="tou">
+      <div class="eu-shift-controls">
+        <div class="eu-field">
+          <label for="shift-pct">Share of peak use moved <b data-draw="shift-pct">—</b></label>
+          <input class="eu-range" type="range" id="shift-pct" min="0" max="100" step="10" value="30">
+        </div>
+        <div class="eu-field">
+          <label for="shift-to">Moved to</label>
+          <select class="dash-select" id="shift-to">
+            <option value="Super off-peak">Super off-peak, 9 am–3 pm</option>
+            <option value="Off-peak">Off-peak, 9 pm–9 am</option>
+          </select>
+        </div>
+      </div>
+      <div class="eu-tile" id="shift-result">
+        <span class="eu-label">Saving every 30 days</span>
+        <span class="eu-big dash-skeleton" data-draw="shift-30">—</span>
+        <span class="eu-sub">Moving <b data-draw="shift-kwh">—</b> kWh a day would have saved <b data-draw="shift-saving">—</b> over the <b data-draw="days">—</b> days, <b data-draw="shift-day">—</b> a day.</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="eu-sec" id="daily">
+    <div class="eu-sec-top">
+      <h2 id="daily-heading">Use per day</h2>
+      <div class="eu-toggle" role="group" aria-label="Show daily chart as">
+        <button type="button" data-measure="cost" aria-pressed="true">Cost</button>
+        <button type="button" data-measure="kWh" aria-pressed="false">kWh</button>
+      </div>
+    </div>
+    <p class="eu-note">The dearest day was <b data-draw="high-day">—</b> at <b data-draw="high-cost">—</b>, the cheapest <b data-draw="low-day">—</b> at <b data-draw="low-cost">—</b>. Select a day to see its half-hours below.</p>
+    <div class="eu-legend" id="daily-legend">
+      <span><i class="eu-sw eu-sw-off"></i>Off-peak, 9 pm–9 am</span>
+      <span><i class="eu-sw eu-sw-super"></i>Super off-peak, 9 am–3 pm</span>
+      <span><i class="eu-sw eu-sw-peak"></i>Peak, 3 pm–9 pm</span>
+      <span data-when="cost"><i class="eu-sw eu-sw-supply"></i>Supply charge</span>
+      <span><i class="eu-ln"></i>7-day average</span>
+    </div>
+    <div class="eu-chart dash-skeleton" id="daily-chart" data-draw="daily-chart" data-source="daily"></div>
+  </section>
+
+  <section class="eu-sec" id="anomalies">
+    <div class="eu-sec-head">
+      <h2 id="anomalies-heading">Unusual usage</h2>
+      <p class="eu-note" data-draw="anom-lede">—</p>
+      <p class="eu-note" data-draw="anom-base">—</p>
+    </div>
+    <div class="eu-anom-charts">
+      <div class="eu-anom-chart">
+        <h3>Each day against the four weeks around it</h3>
+        <div class="eu-legend">
+          <span><i class="eu-sw eu-sw-dot"></i>Day’s use</span>
+          <span><i class="eu-sw eu-sw-band"></i>Usual range</span>
+          <span><i class="eu-ln eu-ln-dash"></i>Usual</span>
+          <span><i class="eu-sw eu-sw-dot eu-sw-high"></i>Much more than usual</span>
+          <span><i class="eu-sw eu-sw-dot eu-sw-low"></i>Much less than usual</span>
+        </div>
+        <div class="eu-chart eu-chart-mid dash-skeleton" id="anom-days-chart" data-draw="anom-days-chart" data-source="usualDays"></div>
+      </div>
+      <div class="eu-anom-chart">
+        <h3>Always-on use, the least the home draws each day</h3>
+        <div class="eu-legend">
+          <span><i class="eu-ln"></i>Always-on use</span>
+          <span><i class="eu-ln eu-ln-dash"></i>Usual</span>
+          <span><i class="eu-sw eu-sw-raised"></i>Raised for 3 days or more</span>
+        </div>
+        <div class="eu-chart eu-chart-mid dash-skeleton" id="anom-base-chart" data-draw="anom-base-chart" data-source="usualDays"></div>
+      </div>
+    </div>
+    <h3 id="anom-table-heading">What stood out</h3>
+    <p class="eu-note">Biggest first, by what the difference cost on <b data-draw="tariff-name">—</b>. Select a column heading to sort by it instead, or a date to see that day’s half-hours below.</p>
+    <div class="eu-tablewrap">
+      <table class="eu-table" id="anom-table" aria-labelledby="anom-table-heading" data-sort-self>
+        <thead>
+          <tr>
+            <th scope="col">When</th>
+            <th scope="col">What</th>
+            <th scope="col" class="eu-num">Used</th>
+            <th scope="col" class="eu-num">Usual</th>
+            <th scope="col" class="eu-num">Difference</th>
+            <th scope="col" class="eu-num">Cost of the difference</th>
+          </tr>
+        </thead>
+        <tbody data-draw="anom-rows"></tbody>
+      </table>
+    </div>
+    <div data-draw="anom-more"></div>
+    <h3 id="checks-heading">Data checks</h3>
+    <ul class="eu-checks" aria-labelledby="checks-heading" data-draw="data-checks"></ul>
+  </section>
+
+  <section class="eu-sec" id="day">
+    <div class="eu-sec-top">
+      <h2 id="day-heading">Half-hour by half-hour</h2>
+      <div class="eu-controls">
+        <div class="eu-toggle" role="group" aria-label="Show half-hour chart as">
+          <button type="button" data-measure="cost" aria-pressed="true">Cost</button>
+          <button type="button" data-measure="kWh" aria-pressed="false">kWh</button>
+        </div>
+        <div class="eu-stepper">
+          <button type="button" class="eu-btn" id="day-prev" data-step="-1" aria-label="Previous day">‹</button>
+          <select class="dash-select" id="day-pick" data-draw="day-pick" data-source="daily" aria-label="Day to show"></select>
+          <button type="button" class="eu-btn" id="day-next" data-step="1" aria-label="Next day">›</button>
+        </div>
+      </div>
+    </div>
+    <dl class="eu-facts" id="day-facts">
+      <div><dt>Total</dt><dd><span data-draw="day-cost">—</span><small><span data-draw="day-total">—</span> kWh</small></dd></div>
+      <div><dt><i class="eu-sw eu-sw-off"></i>Off-peak</dt><dd><span data-draw="day-off-cost">—</span><small><span data-draw="day-off">—</span> kWh</small></dd></div>
+      <div><dt><i class="eu-sw eu-sw-super"></i>Super off-peak</dt><dd><span data-draw="day-super-cost">—</span><small><span data-draw="day-super">—</span> kWh</small></dd></div>
+      <div><dt><i class="eu-sw eu-sw-peak"></i>Peak</dt><dd><span data-draw="day-peak-cost">—</span><small><span data-draw="day-peak">—</span> kWh</small></dd></div>
+      <div><dt><i class="eu-sw eu-sw-supply"></i>Supply</dt><dd><span data-draw="day-supply">—</span></dd></div>
+      <div><dt>Billing</dt><dd data-draw="day-status">—</dd></div>
+    </dl>
+    <div class="eu-legend" id="day-legend">
+      <span><i class="eu-ln eu-ln-dash"></i>Average for that half-hour across all days</span>
+      <span data-when="cost">Bars show energy only; the supply charge is per day</span>
+    </div>
+    <div class="eu-chart dash-skeleton" id="day-chart" data-draw="day-chart" data-source="halfHours profile"></div>
+  </section>
+
+  <section class="eu-sec" id="heatmap">
+    <div class="eu-sec-top">
+      <h2 id="heatmap-heading">Every half-hour</h2>
+      <div class="eu-toggle" role="group" aria-label="Show heat map as">
+        <button type="button" data-measure="cost" aria-pressed="true">Cost</button>
+        <button type="button" data-measure="kWh" aria-pressed="false">kWh</button>
+      </div>
+    </div>
+    <p class="eu-note">Each column is a day and each row a half-hour, midnight at the top. The stronger the cell, the more it used or cost; cost here is energy only. The strip on the left shows the rate period. Select a column to open that day above.</p>
+    <div class="eu-chart eu-chart-tall dash-skeleton" id="heatmap-chart" data-draw="heatmap" data-source="halfHours"></div>
+  </section>
+
+  <section class="eu-sec eu-half" id="profile">
+    <div class="eu-sec-top">
+      <h2 id="profile-heading">An average day</h2>
+      <div class="eu-toggle" role="group" aria-label="Show average day as">
+        <button type="button" data-measure="cost" aria-pressed="true">Cost</button>
+        <button type="button" data-measure="kWh" aria-pressed="false">kWh</button>
+      </div>
+    </div>
+    <p class="eu-note">The average for each half-hour, energy only. Weekdays averaged <b data-draw="wd-avg">—</b> kWh (<b data-draw="wd-cost">—</b> with supply) a day and weekends <b data-draw="we-avg">—</b> kWh (<b data-draw="we-cost">—</b>).</p>
+    <div class="eu-legend" id="profile-legend">
+      <span><i class="eu-ln"></i>Weekdays</span>
+      <span><i class="eu-ln eu-ln-dash"></i>Weekends</span>
+    </div>
+    <div class="eu-chart dash-skeleton" id="profile-chart" data-draw="profile-chart" data-source="profile"></div>
+  </section>
+
+  <section class="eu-sec eu-half" id="weekdays">
+    <div class="eu-sec-top">
+      <h2 id="weekdays-heading">By day of the week</h2>
+      <div class="eu-toggle" role="group" aria-label="Show day-of-week chart as">
+        <button type="button" data-measure="cost" aria-pressed="true">Cost</button>
+        <button type="button" data-measure="kWh" aria-pressed="false">kWh</button>
+      </div>
+    </div>
+    <p class="eu-note">The average day for each day of the week. Cost includes the supply charge.</p>
+    <div class="eu-chart eu-chart-mid dash-skeleton" id="weekday-chart" data-draw="weekday-chart" data-source="weekdays"></div>
+  </section>
+
+  <section class="eu-sec" id="months">
+    <div class="eu-sec-head">
+      <h2 id="months-heading">Month by month</h2>
+      <p class="eu-note">On <b data-draw="tariff-name">—</b>. Only days inside the chosen dates count.</p>
+    </div>
+    <div class="eu-tablewrap">
+      <table class="eu-table" id="month-table" data-source="monthly" data-row-key="range,tariff,month">
+        <thead>
+          <tr>
+            <th scope="col" data-field="month">Month</th>
+            <th scope="col" class="eu-num" data-field="days">Days</th>
+            <th scope="col" class="eu-num" data-field="kWh">kWh</th>
+            <th scope="col" class="eu-num" data-field="kWhPerDay">kWh a day</th>
+            <th scope="col" class="eu-num" data-field="energy">Energy</th>
+            <th scope="col" class="eu-num" data-field="supply">Supply</th>
+            <th scope="col" class="eu-num" data-field="cost">Total</th>
+            <th scope="col" class="eu-num" data-field="costPerDay">Total a day</th>
+          </tr>
+        </thead>
+        <tbody data-draw="month-rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <details class="eu-about" id="about">
+    <summary>About these figures</summary>
+    <ul>
+      <li>The readings come from <span data-app="file-name">the file you opened</span>: one kWh reading per half-hour, labelled with the time the half-hour starts.</li>
+      <li>Each reading sits in one of three columns, which sets its rate period: off-peak 9 pm–9 am, super off-peak 9 am–3 pm, peak 3 pm–9 pm. The hours are the same every day, weekends included.</li>
+      <li>Tariff rates and supply charges come from the tariff list (Tariffs, at the top of the page), in cents. The tariff marked current there is the one the page opens on and compares against.</li>
+      <li>A half-hour’s energy cost is its kWh times its period’s rate. Each day also adds that tariff’s supply charge.</li>
+      <li>Every tariff is priced on the same half-hourly use. On a different tariff you might use electricity at different times.</li>
+      <li>The savings estimate moves the chosen share of every day’s peak kWh to the chosen period and prices it at that period’s rate. Total kWh stays the same.</li>
+      <li>The dates chosen at the top apply to every figure and chart. “Cost per day” compares the last 7 days up to the end of the chosen dates with the 7 days before them.</li>
+      <li>Unusual usage compares each day with up to 14 days either side of it. A day stands out when it used more than 9 in 10 of those days and at least 25% more than their middle value, or less than 9 in 10 of them and at least 25% less.</li>
+      <li>A spike is a half-hour that used at least 0.75 kWh more, and half as much again, as that time of day reaches on 9 in 10 of those days, so things that happen most days don’t count. Its difference is measured against the middle value for that time.</li>
+      <li>Always-on use is the average of each day’s four lowest half-hours, as watts. It counts as raised when it is at least 40% and 150 W above the middle value of the days around it for 3 days or more in a row. For a raised stretch, “What stood out” shows the always-on part of use: those days’ always-on watts kept up for 24 hours a day, in kWh, against the usual watts over the same hours, priced at the tariff’s rates weighted by the hours each one applies (as is the yearly always-on cost). Other use can rise or fall at the same time, so the line under it gives what all use on those days came to against usual.</li>
+      <li>Days with missing half-hours are left out of those comparisons, and “Data checks” lists them.</li>
+      <li>Daily kWh are rounded to 0.1 kWh and costs to the cent, so parts may not add up exactly.</li>
+      <li>“Not yet billed” readings have not appeared on a bill yet.</li>
+    </ul>
+  </details>
+</div>
+</main>
+
+<footer class="app-foot">
+  <p>Everything runs in this browser: files you open are never uploaded. <span id="app-offline"></span></p>
+  <p>An independent tool, not made by or affiliated with Synergy.</p>
+  <p>Charts drawn with d3 v7.9.0 (<a href="vendor/d3-LICENSE.txt">ISC licence</a>).</p>
+</footer>
+
+<div class="app-drop" id="app-drop" hidden><p>Drop the CSV to open it</p></div>
+
+<dialog class="app-dialog" id="tariff-dialog" aria-labelledby="tariff-title">
+  <form id="tariff-form" novalidate>
+    <div class="app-dialog-head">
+      <h2 id="tariff-title">Tariffs</h2>
+      <button type="button" class="app-msg-close" data-close aria-label="Close">×</button>
+    </div>
+    <p class="app-hint">Prices in cents, as on your bill. Peak is 3 pm–9 pm, off-peak 9 pm–9 am and super off-peak 9 am–3 pm, the same periods as the meter file. For a flat-rate plan, enter its one rate in all three. The current tariff is the one the dashboard opens on and compares the others with.</p>
+    <div class="app-tariffs" id="tariff-list"></div>
+    <button type="button" class="app-btn" id="tariff-add">Add a tariff</button>
+    <p id="tariff-status" hidden></p>
+    <div class="app-dialog-foot">
+      <div class="app-dialog-tools">
+        <button type="button" class="app-btn app-btn-quiet" id="tariff-import">Import CSV…</button>
+        <button type="button" class="app-btn app-btn-quiet" id="tariff-export">Export CSV</button>
+        <button type="button" class="app-btn app-btn-quiet" id="tariff-reset">Restore defaults</button>
+      </div>
+      <div class="app-dialog-main">
+        <button type="button" class="app-btn" data-close>Cancel</button>
+        <button type="submit" class="app-btn app-btn-primary">Save</button>
+      </div>
+    </div>
+  </form>
+  <input type="file" id="tariff-file" accept=".csv,text/csv" hidden>
+</dialog>
+
+<dialog class="app-dialog app-dialog-narrow" id="help-dialog" aria-labelledby="help-title">
+  <div class="app-dialog-body">
+    <div class="app-dialog-head">
+      <h2 id="help-title">Download your usage data from Synergy</h2>
+      <button type="button" class="app-msg-close" data-close aria-label="Close">×</button>
+    </div>
+    <div id="help-steps"></div>
+  </div>
+</dialog>
+
+<template id="tariff-card">
+  <fieldset class="app-tariff">
+    <legend>Tariff</legend>
+    <div class="app-tariff-top">
+      <label class="app-field app-field-name"><span>Name</span><input name="tariff" type="text" autocomplete="off" spellcheck="false"></label>
+      <label class="app-current"><input type="radio" name="current"> Current tariff</label>
+      <button type="button" class="app-btn app-btn-quiet app-remove">Remove</button>
+    </div>
+    <div class="app-tariff-rates">
+      <label class="app-field"><span>Supply, ¢ a day</span><input data-col="supply_cents_per_day" type="text" inputmode="decimal" autocomplete="off"></label>
+      <label class="app-field"><span>Peak, ¢/kWh</span><input data-col="peak_cents_per_kwh" type="text" inputmode="decimal" autocomplete="off"></label>
+      <label class="app-field"><span>Off-peak, ¢/kWh</span><input data-col="off_peak_cents_per_kwh" type="text" inputmode="decimal" autocomplete="off"></label>
+      <label class="app-field"><span>Super off-peak, ¢/kWh</span><input data-col="super_off_peak_cents_per_kwh" type="text" inputmode="decimal" autocomplete="off"></label>
+    </div>
+  </fieldset>
+</template>
+</body>
+</html>

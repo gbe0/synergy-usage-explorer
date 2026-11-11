@@ -1,0 +1,328 @@
+# Synergy Usage Explorer (static web app)
+
+A web app that turns a smart meter's half-hourly interval CSV (such as
+`MA_IntervalDataHistory.csv`) into an interactive dashboard of use and cost.
+It shows:
+
+- cost on each tariff, with a side-by-side comparison
+- use per day and per half-hour
+- a heat map, an average day, and month and weekday breakdowns
+- a savings calculator for moving peak use
+- unusual usage: days, spikes and stretches of raised always-on use that
+  stand out from the weeks around them, what each cost, and checks on the
+  data itself (gaps, zero runs, repeated readings, readings in the wrong
+  rate period, repeated times, negative values)
+
+Every figure follows the tariff and dates you pick.
+
+Everything happens in the browser:
+
+- There is no server code, no build step and nothing to install.
+- The CSV is never uploaded.
+- Once it has been opened online, it works with no internet connection.
+
+Synergy Usage Explorer is an independent tool. It is not made by, or
+affiliated with, Synergy.
+
+## What's here
+
+```
+synergy_usage_tool/
+  README.md            this file
+  stamp_version.py     run after changing anything in public/ (see "Changing the app")
+  public/              the app: upload the contents of this folder
+    data/tariffs.csv   the default tariffs: edit this to change them (see "Changing the default tariffs")
+    data/sample-interval-data.csv   the sample readings behind "Try it with sample data"
+    index.html         the page
+    sw.js              service worker: keeps a copy of the app for offline use
+    manifest.webmanifest, icons/   lets it be installed like an app
+    css/app.css        colours, type, and the parts around the dashboard
+    css/dashboard.css  dashboard layout and chart styles
+    js/app.js          opening and checking files, tariff editor, saving, offline/install
+    js/runtime.js      runs the dashboard's data steps and redraws on each choice
+    js/dashboard.js    the dashboard: figures and charts
+    js/default-tariffs.js, js/sample-data.js   made from data/ by stamp_version.py; don't edit
+    vendor/            d3 v7.9.0 charting library and its ISC licence
+  tests/               tests of the dashboard's figures (see "Checks")
+  package.json, eslint.config.mjs, ruff.toml   settings for the checks; the app doesn't use them
+  .github/workflows/   GitHub Actions: the checks, and publishing to GitHub Pages
+```
+
+The app loads nothing from other sites: there are no CDNs, web fonts or analytics.
+
+## Trying it
+
+- **Straight from disk:** open `public/index.html` in a browser. This works
+  offline, since the files are already on your computer. The service worker
+  and the install button don't apply here.
+- **As it will run when hosted:**
+  ```
+  python3 -m http.server 8000 -d public
+  ```
+  Then open http://localhost:8000/. Browsers treat localhost like https, so
+  offline mode and installing can be tried here.
+
+## Deploying to static hosting
+
+Upload the contents of `public/` to any static host, for example GitHub Pages,
+Netlify, Cloudflare Pages, Amazon S3 or CloudFront, an nginx or Apache folder,
+or a shared web host.
+
+- **It must be served over https.** Browsers only allow offline mode and
+  installing on https (or localhost). Over plain http the dashboard still
+  works, but only while online, and its footer says so.
+- **It can live in a sub-folder** (such as `https://example.com/power/`). All
+  paths are relative.
+- No server settings are needed. Any host that serves `index.html` for the
+  folder address is fine.
+
+### GitHub Pages
+
+`.github/workflows/pages.yml` publishes `public/` each time `main` changes,
+once the checks pass. It runs `stamp_version.py` itself before publishing, so
+a change goes live even if the script wasn't run first: for example, new rates
+typed into `public/data/tariffs.csv` with GitHub's web editor. A tariffs.csv
+the script rejects stops the publish, and the site stays as it was.
+
+Set it up once, on GitHub: **Settings → Pages → Build and deployment →
+Source: GitHub Actions**. The site is then at
+`https://<user>.github.io/<repository>/`. To publish again without a change,
+run "Publish to GitHub Pages" from the Actions tab.
+
+## Changing the default tariffs
+
+The tariffs the app starts with are in `public/data/tariffs.csv`, one tariff
+per row; the layout is under "Tariffs CSV" below.
+
+1. **Edit the file.** Change rates, add rows for new tariffs, or remove
+   rows. Mark the tariff most people are on `current` = `yes`.
+2. **Run `python3 stamp_version.py`.** It checks the file, stopping with the
+   line number of any problem. It then copies the file into
+   `js/default-tariffs.js`, which is how the app reads it, and gives the app
+   a new version.
+3. **Upload `public/` again.**
+
+Visitors get the new defaults on their next online visit:
+
+- **Never changed their tariff list, or saved it unchanged:** they see the
+  new defaults straight away.
+- **Edited their own list:** they keep it, and are told once that the
+  defaults changed. **Restore defaults**, under Tariffs, shows the new ones.
+
+The sample readings in `public/data/sample-interval-data.csv` work the same
+way: replace the file, keeping the interval CSV layout, then run the script.
+
+## Changing the app: offline copies and `sw.js`
+
+To work offline, the app saves a copy of its own files in each visitor's
+browser. That's the job of the service worker, `public/sw.js`, a small
+browser script.
+
+- **The saved copies are always used.** On a visitor's first online visit,
+  `sw.js` saves every app file on their device. From then on the browser uses
+  those saved copies, even when the device is online.
+- **New files are only fetched when `sw.js` changes.** Browsers check `sw.js`
+  for changes, and fetch everything again only when it does.
+- **So after any change, run the stamp script**, from the project
+  folder, then upload `public/` again:
+  ```
+  python3 stamp_version.py
+  ```
+  It sets `VERSION` in `sw.js` from the contents of every file. It also keeps
+  `sw.js`'s list of files to save up to date, which matters if you add a file,
+  and copies the CSV files in `data/` into the scripts the app reads.
+- **If you skip that step, returning visitors don't see your change.**
+  Anyone who has opened the app before, you included, keeps getting the old
+  version. If you can't run Python, change the `VERSION` line in
+  `sw.js` to any new value by hand. A file you added must also be added to
+  `FILES` there. Changes to the CSV files in `data/` do need the script.
+- **Visitors get the new version on their next online visit.** The app
+  downloads it in the background and shows "A new version of the app has
+  been downloaded" with a Reload button.
+- **Offline mode starts after one online visit over https.** It doesn't apply
+  when `index.html` is opened straight from disk. That case always uses the
+  files as they are on disk, so it needs no version change.
+
+To check whether `sw.js` is up to date, for example in CI, run:
+
+```
+python3 stamp_version.py --check
+```
+
+It exits with status 1 if `sw.js` needs stamping. The checks below run it.
+
+To get the newest copy on your own device while testing, either reload twice,
+or open the browser's developer tools and use Application → Service workers →
+Update, or "Clear site data".
+
+## Checks
+
+GitHub Actions runs these on every pull request and on every push
+(`.github/workflows/ci.yml`), and again before each publish to GitHub Pages:
+
+- `stamp_version.py`: `data/tariffs.csv` and the sample CSV can be read. If
+  `sw.js` or the generated js files weren't stamped after a change, that is
+  only a warning, since publishing stamps them anyway; run
+  `python3 stamp_version.py` and commit to bring the repository copy up to date.
+- ESLint on the app's JavaScript, and Ruff on `stamp_version.py`.
+- The tests in `tests/`. They run the dashboard's data steps on the sample
+  readings in Node: every reading is counted once, bills add up, the cheapest
+  tariff ranks first, and the events added to the sample (the weekend away,
+  the car charging, the power cut and so on) are found. If you replace the
+  sample data, update the dates in `tests/dashboard.test.js`.
+
+To run them yourself you need Node 20.19 or later and Python 3.8 or later:
+
+```
+npm ci                # once: installs ESLint into node_modules/
+npm run check         # stamp check, ESLint and the tests
+uvx ruff check .      # or: pipx run ruff check .
+```
+
+## Using it
+
+**Trying it first.** "Try it with sample data" on the first page loads 90
+days of real readings, re-dated to July–September 2025. Events have been
+added so that every feature has something to show:
+
+- a hot-water boost overnight
+- a weekend away
+- an electric car charging at peak
+- a heatwave
+- a heater left on for six days
+- a power cut
+- a short meter dropout
+
+A note above the dashboard lists them with their dates. Opening or adding
+your own file replaces the sample; the sample is never merged with your
+readings. The same page also has a link to download the sample CSV.
+
+**Getting the data from Synergy.** The first page shows these steps, and
+"How to download from Synergy" above the dashboard shows them again:
+
+1. Log in to your Synergy account at https://my.synergy.net.au/.
+2. Select the **Usage** tab at the top of the page.
+3. Check that you're on the **Interval Data** page. Below the usage graph,
+   select **Export**.
+4. Set **Export as** to **CSV**, choose **half-hourly** data intervals and the
+   dates you want, then export.
+5. Open the CSV in this app.
+
+Synergy exports up to 90 days at a time. For a longer period, export each 90
+days and open the files together.
+
+**Then:**
+
+1. **Open the CSV files.** Use Open CSV… or drop them anywhere on the page.
+   You can choose several at once. When your provider exports 90 days at a
+   time, open all the exports you have. Later, use **Add CSV files…** above
+   the dashboard, or drop a file on the page, to add the newest export to
+   what's already open. "Show the files" lists each file, with Remove.
+2. **Pick a tariff and dates** at the top of the dashboard. Every figure and
+   chart follows them.
+3. **Use Tariffs to edit the tariffs.** You can change the rates, add or
+   remove tariffs, choose which one is current, and import or export a
+   tariffs CSV. The app starts with the tariffs in `data/tariffs.csv`, which
+   are Synergy Midday Saver (current) and Home Plan.
+
+**Light or dark.** The app follows the device's light or dark setting. The
+sun/moon button in the top bar switches it, and the choice is remembered in
+that browser.
+
+**How unusual usage is judged.** Each day is compared with up to 14 days
+either side of it, so seasons and gradual changes don't count as unusual:
+
+- **Unusual days** used more than 9 in 10 of those days and at least 25% more
+  than their middle value, or the same the other way for low days.
+- **Spikes** are half-hours at least 0.75 kWh above what that time of day
+  reaches on 9 in 10 days. Things that happen most days, like a morning hot
+  water boost, therefore don't count.
+- **Always-on use** is the average of each day's four lowest half-hours. It
+  counts as raised when it is at least 40% and 150 W above usual for 3 days
+  or more in a row.
+
+The details are under "About these figures" at the bottom of the dashboard.
+
+**Overlapping files and repeated readings.** Each half-hour is counted once,
+however many files, or how many rows of a hand-joined file, contain it:
+
+- **Which copy wins:** a billed reading beats one not yet billed. Otherwise
+  the copy from the file whose readings run latest wins, and within one file
+  the later row.
+- **Joined files:** header rows repeated part-way down a joined file are
+  skipped.
+- **Reporting:** the line above the dashboard says how many half-hours
+  overlapped, and how many had differing readings.
+- **Duplicate files:** opening a file that is already open is ignored.
+
+**Missing half-hours.** Every day should have 48 readings. Gaps from
+00:00 on the first day to 23:30 on the last are listed above the dashboard
+as soon as files are opened, for example "Tue 20 Oct 2026, 13:00–13:30" or
+two whole days between two exports. **Data checks** lists the gaps in the
+chosen dates. Nothing is counted for missing times, so totals there are
+understated.
+
+**Sorting tables.** Select any column heading to sort by it: numbers biggest
+first, words A to Z. Select it again to reverse, and a third time to go back
+to the table's own order. "What stood out" sorts its whole list, not just the
+rows on show. Sorting is remembered.
+
+**What's kept in the browser.** The browser keeps the files you opened,
+your tariffs, and your choices. All of this stays in that browser's own
+storage (IndexedDB and localStorage) on that device and is never sent
+anywhere. **Forget this data**, above the dashboard, removes the readings.
+Tariffs stay until you change them.
+
+**Nothing is sent anywhere.** The app has no code that sends data. As a
+backstop, the page's Content-Security-Policy has `connect-src 'none'`, so the
+browser refuses any network request the page tries to make itself (fetch,
+XHR, WebSockets or beacons).
+
+### Interval CSV
+
+These columns are needed, in any order:
+
+| Column | Contents |
+| --- | --- |
+| `Date` | DD/MM/YYYY, MM/DD/YYYY or YYYY-MM-DD |
+| `Time` | start of the half-hour, HH:MM |
+| `PEAK (KWH)`, `OFF PEAK (KWH)`, `SUPER OFF PEAK (KWH)` | one reading per row, in whichever column applies |
+| `Billing Status` | optional: `Billed`, or anything else for not yet billed |
+
+**How the date order is chosen.** The app works out day/month or
+month/day order from the dates themselves. If every date could be read either
+way, it reads them as day/month and shows a "Dates are" choice so you can
+switch.
+
+**What gets flagged.** Problems that stop the file being read are reported
+with their line number. Data problems, such as missing half-hours or days,
+zero runs, repeated readings and repeated times, are listed under
+**Data checks** in the Unusual usage section.
+
+### Tariffs CSV
+
+This is the layout of `public/data/tariffs.csv`, and of the files Tariffs
+imports and exports. Visitors can also replace their own tariff list by
+dropping a tariffs CSV on the page, or by importing one under Tariffs. Rates are in cents. A flat-rate plan repeats one rate in all
+three rate columns.
+
+```
+tariff,current,supply_cents_per_day,peak_cents_per_kwh,off_peak_cents_per_kwh,super_off_peak_cents_per_kwh
+Synergy Midday Saver,yes,132.7806,55.3253,24.3431,8.8520
+Home Plan,no,119.2419,33.2621,33.2621,33.2621
+```
+
+## Browsers
+
+It is written for current Chrome, Edge, Firefox and Safari, on desktop and
+phone. So far it has been tested in Chrome only. Installing is offered where
+the browser supports it:
+
+- **Chrome and Edge:** an Install app button appears.
+- **Safari on iPhone:** use Share → Add to Home Screen.
+- **Safari on Mac:** use File → Add to Dock.
+
+## Licences
+
+d3 is © Mike Bostock and is used under the ISC licence, included in
+`public/vendor/d3-LICENSE.txt`.

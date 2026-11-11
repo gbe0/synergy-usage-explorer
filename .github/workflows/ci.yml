@@ -1,0 +1,50 @@
+# Lint and test. Runs on pull requests and on pushes to branches other than
+# main; pushes to main are checked by pages.yml, which calls this workflow
+# before it publishes.
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # stamp_version.py checks tariffs.csv and the sample CSV, and fails if
+      # either is broken. A repository copy that wasn't stamped after a change
+      # (say, tariffs.csv edited on GitHub) only gets a warning: pages.yml
+      # runs the script itself before it publishes.
+      - name: Check the CSVs and stamp sw.js
+        run: |
+          stale=0
+          python3 stamp_version.py --check || stale=1
+          python3 stamp_version.py
+          if [ "$stale" = 1 ]; then
+            echo "::warning title=Not stamped::sw.js or the generated js files in the repository are out of date. The site is still published correctly, since the publish workflow runs stamp_version.py itself; run python3 stamp_version.py and commit to update the repository copy."
+          fi
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+
+      - name: ESLint
+        run: npx eslint .
+
+      - name: Ruff (stamp_version.py)
+        run: pipx run --spec ruff==0.17.4 ruff check --output-format=github .
+
+      - name: Tests
+        run: npm test

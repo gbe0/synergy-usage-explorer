@@ -1,0 +1,21 @@
+# Dev tools (npm ci reinstalls them)
+node_modules/
+
+# Caches from Python, Ruff and test runs
+__pycache__/
+*.py[cod]
+.ruff_cache/
+coverage/
+*.log
+
+# Editors and operating systems
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local settings and secrets that should never be shared
+.env
+.env.*
+.claude/settings.local.json
