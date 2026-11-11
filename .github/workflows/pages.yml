@@ -1,14 +1,16 @@
-# Publishes public/ to GitHub Pages on every push to main, once the checks
-# pass. It runs stamp_version.py itself, so edits made on GitHub go live too.
+# Publishes public/ to GitHub Pages on every push to the production branch,
+# and only then, once the checks pass. It runs stamp_version.py itself, so
+# edits made on GitHub go live too.
 #
-# One-time setup on GitHub: Settings → Pages → Build and deployment →
-# Source: "GitHub Actions".
+# One-time setup on GitHub:
+# - Settings → Pages → Build and deployment → Source: "GitHub Actions".
+# - Settings → Environments → github-pages → Deployment branches and tags:
+#   allow `production`. GitHub only lets the default branch deploy at first.
 name: Publish to GitHub Pages
 
 on:
   push:
-    branches: [main]
-  workflow_dispatch:
+    branches: [production]
 
 permissions:
   contents: read
